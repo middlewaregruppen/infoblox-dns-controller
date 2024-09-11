@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strconv"
 	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -37,13 +38,20 @@ import (
 
 	ibclient "github.com/infobloxopen/infoblox-go-client/v2"
 	"github.com/middlewaregruppen/infoblox-dns-controller/internal/controller"
-	iclient "github.com/middlewaregruppen/infoblox-dns-controller/pkg/client"
 	//+kubebuilder:scaffold:imports
 )
 
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
+
+	infobloxServer   string
+	infobloxPort     uint
+	infobloxUsername string
+	infobloxPassword string
+	infobloxVersion  string
+	infobloxView     string
+	infobloxZone     string
 )
 
 func init() {
@@ -58,15 +66,22 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+
+	// Default vars
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&secureMetrics, "metrics-secure", false,
-		"If set the metrics endpoint is served securely")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", false, "If set the metrics endpoint is served securely")
+	flag.BoolVar(&enableHTTP2, "enable-http2", false, "If set, HTTP/2 will be enabled for the metrics and webhook servers")
+
+	// Our vars
+	flag.StringVar(&infobloxServer, "infoblox-server", "localhost", "Host name or IP address of the Infoblox server")
+	flag.UintVar(&infobloxPort, "infoblox-port", 443, "The port number of the Infoblox server")
+	flag.StringVar(&infobloxUsername, "infoblox-username", "", "Username to authenticate as to the Infoblox server")
+	flag.StringVar(&infobloxPassword, "infoblox-password", "", "Password of the user to authenticate as to the Infoblox server")
+	flag.StringVar(&infobloxVersion, "infoblox-version", "v2.12.1", "The version of the Infoblox server")
+	flag.StringVar(&infobloxView, "infoblox-view", "", "The Infoblox View to use for this controller")
+	flag.StringVar(&infobloxZone, "infoblox-zone", "", "The Infoblox Zone to use for this controller")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -125,13 +140,13 @@ func main() {
 
 	// Setup infoblox connector
 	hostConfig := ibclient.HostConfig{
-		Host:    os.Getenv("INFOBLOX_SERVER"),
-		Port:    os.Getenv("INFOBLOX_PORT"),
-		Version: os.Getenv("INFOBLOX_VERSION"),
+		Host:    infobloxServer,
+		Port:    strconv.FormatUint(uint64(infobloxPort), 10),
+		Version: infobloxVersion,
 	}
 	authCfg := ibclient.AuthConfig{
-		Username: os.Getenv("INFOBLOX_USERNAME"),
-		Password: os.Getenv("INFOBLOX_PASSWORD"),
+		Username: infobloxUsername,
+		Password: infobloxPassword,
 	}
 	transportConfig := ibclient.NewTransportConfig("false", 20, 10)
 	requestBuilder := &ibclient.WapiRequestBuilder{}
@@ -140,14 +155,22 @@ func main() {
 	// Replace the 'v' in version attribute
 	hostConfig.Version = strings.Replace(hostConfig.Version, "v", "", 1)
 	ibsConn, err := ibclient.NewConnector(hostConfig, authCfg, transportConfig, requestBuilder, requestor)
+	if err != nil {
+		setupLog.Error(err, "unable to create infoblox connector: %v", err)
+		os.Exit(1)
+	}
 
-	// Setup infoblox client
-	ic := iclient.NewInfobloxClient(ibsConn)
+	// Setup controller config
+	cfg := &controller.InfobloxConfig{
+		View:    infobloxView,
+		Zone:    infobloxZone,
+		Version: infobloxVersion,
+	}
 
 	if err = (&controller.IngressReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr, ic); err != nil {
+	}).SetupWithManager(mgr, ibsConn, cfg); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
 		os.Exit(1)
 	}
