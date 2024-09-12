@@ -25,12 +25,12 @@ jobs:
 
       - name: Build Binaries
         run: |
-          GOOS=linux GOARCH=amd64 BUILDPATH=./bin/harbor-operator-linux-amd64 make
-          GOOS=linux GOARCH=arm BUILDPATH=./bin/harbor-operator-linux-arm make
-          GOOS=linux GOARCH=arm64 BUILDPATH=./bin/harbor-operator-linux-arm64 make
-          GOOS=windows GOARCH=amd64 BUILDPATH=./bin/harbor-operator-windows-amd64.exe make
-          GOOS=darwin GOARCH=amd64 BUILDPATH=./bin/harbor-operator-darwin-amd64 make
-          GOOS=darwin GOARCH=arm64 BUILDPATH=./bin/harbor-operator-darwin-arm64 make
+          GOOS=linux GOARCH=amd64 BUILDPATH=./bin/infoblox-controller-linux-amd64 make
+          GOOS=linux GOARCH=arm BUILDPATH=./bin/infoblox-controller-linux-arm make
+          GOOS=linux GOARCH=arm64 BUILDPATH=./bin/infoblox-controller-linux-arm64 make
+          GOOS=windows GOARCH=amd64 BUILDPATH=./bin/infoblox-controller-windows-amd64.exe make
+          GOOS=darwin GOARCH=amd64 BUILDPATH=./bin/infoblox-controller-darwin-amd64 make
+          GOOS=darwin GOARCH=arm64 BUILDPATH=./bin/infoblox-controller-darwin-arm64 make
 
       - name: Create Release
         uses: ncipollo/release-action@v1
