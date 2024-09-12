@@ -119,6 +119,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Check for presence of the annotation and that it's set to true
 	if !isManagedByController(ingress) {
+		l.Info("Not controlled by controller")
 		return ctrl.Result{}, nil
 	}
 
@@ -141,6 +142,8 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+
+	return ctrl.Result{}, nil
 
 	for _, host := range hosts {
 
@@ -243,17 +246,14 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 func isManagedByController(ing *netv1.Ingress) bool {
-	var found bool
-
 	for k, v := range ing.Annotations {
 		if slices.Contains(allowedAnnotations, k) {
 			if strings.Compare(strings.ToLower(v), "true") != 0 {
-				found = true
+				return true
 			}
 		}
 	}
-
-	return found
+	return true
 }
 
 func getIngressHosts(ing *netv1.Ingress) ([]string, error) {
