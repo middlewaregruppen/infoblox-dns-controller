@@ -143,8 +143,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
-
 	for _, host := range hosts {
 
 		// Check if Host record exists. If it's not found then a new host record is created
