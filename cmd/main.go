@@ -120,7 +120,7 @@ func main() {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "e492e0ec.my.domain",
+		LeaderElectionID:       "infoblox-dns-controller-leader-election",
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -156,7 +156,7 @@ func main() {
 	hostConfig.Version = strings.Replace(hostConfig.Version, "v", "", 1)
 	ibsConn, err := ibclient.NewConnector(hostConfig, authCfg, transportConfig, requestBuilder, requestor)
 	if err != nil {
-		setupLog.Error(err, "unable to create infoblox connector: %v", err)
+		setupLog.Error(err, "unable to create infoblox connector")
 		os.Exit(1)
 	}
 
