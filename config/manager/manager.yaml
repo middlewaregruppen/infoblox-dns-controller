@@ -58,37 +58,63 @@ spec:
         # seccompProfile:
         #   type: RuntimeDefault
       containers:
-      - command:
-        - /manager
-        args:
-        - --leader-elect
-        image: controller:latest
-        name: manager
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - "ALL"
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8081
-          initialDelaySeconds: 15
-          periodSeconds: 20
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8081
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
-        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
-        resources:
-          limits:
-            cpu: 500m
-            memory: 128Mi
-          requests:
-            cpu: 10m
-            memory: 64Mi
+        - command:
+            - /controller
+          args:
+            - --leader-elect
+          env:
+            - name: INFOBLOX_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: infoblox-server-credentials
+                  key: INFOBLOX_USERNAME
+            - name: INFOBLOX_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: infoblox-server-credentials
+                  key: INFOBLOX_PASSWORD
+            - name: INFOBLOX_SERVER
+              valueFrom:
+                secretKeyRef:
+                  name: infoblox-server-credentials
+                  key: INFOBLOX_SERVER
+            - name: INFOBLOX_ZONE
+              valueFrom:
+                secretKeyRef:
+                  name: infoblox-server-credentials
+                  key: INFOBLOX_ZONE
+            - name: INFOBLOX_VIEW
+              valueFrom:
+                secretKeyRef:
+                  name: infoblox-server-credentials
+                  key: INFOBLOX_VIEW
+          image: controller:latest
+          name: manager
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "ALL"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # TODO(user): Configure the resources accordingly based on the project requirements.
+          # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+          resources:
+            limits:
+              cpu: 500m
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

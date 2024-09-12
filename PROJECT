@@ -13,10 +13,6 @@ repo: github.com/middlewaregruppen/infoblox-dns-controller
 resources:
 - controller: true
   domain: my.domain
-  kind: Secret
-  version: v1
-- controller: true
-  domain: my.domain
   group: networking.k8s.io
   kind: Ingress
   version: v1

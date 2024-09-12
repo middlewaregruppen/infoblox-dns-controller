@@ -38,6 +38,9 @@ const ingressFinalizers = "infoblox-dns-controller.k8s.mdlwr.io/finalizer"
 var (
 	ErrObjectNotFound = errors.New("requested object not found")
 	ErrNotFound       = errors.New("not found")
+
+	// Acceptable annotation keys
+	allowedAnnotations = []string{"dns-managed-by/infoblox-dns-webhook", "infoblox-dns-controller/manage"}
 )
 
 // IngressReconciler reconciles a Ingress object
@@ -114,12 +117,14 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Check for presence of the annotation and that it's set to true
-	val, ok := ingress.Annotations["middlewaregruppen.se/managed-dns"]
-	if !ok {
-		return ctrl.Result{}, nil
-	}
-	if strings.Compare(strings.ToLower(val), "true") != 0 {
-		return ctrl.Result{}, nil
+	for _, a := range allowedAnnotations {
+		val, ok := ingress.Annotations[a]
+		if !ok {
+			return ctrl.Result{}, nil
+		}
+		if strings.Compare(strings.ToLower(val), "true") != 0 {
+			return ctrl.Result{}, nil
+		}
 	}
 
 	namespacedName := fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
