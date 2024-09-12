@@ -29,7 +29,7 @@ BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
 #
 # For example, running 'make bundle-build bundle-push catalog-build catalog-push' will build and push both
 # my.domain/infoblox-dns-controller-bundle:$VERSION and my.domain/infoblox-dns-controller-catalog:$VERSION.
-IMAGE_TAG_BASE ?= my.domain/infoblox-dns-controller
+IMAGE_TAG_BASE ?= ghcr.io/middlewaregruppen/infoblox-dns-controller
 
 # BUNDLE_IMG defines the image:tag used for the bundle.
 # You can use it as an arg. (E.g make bundle-build BUNDLE_IMG=<some-registry>/<project-name-bundle>:<tag>)
@@ -131,7 +131,7 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -o bin/infoblox-controller cmd/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
