@@ -113,25 +113,24 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		}
 	}
 
-	// Check for presence of the annotation
+	// Check for presence of the annotation and that it's set to true
 	val, ok := ingress.Annotations["middlewaregruppen.se/managed-dns"]
 	if !ok {
 		return ctrl.Result{}, nil
 	}
-	l.Info("annotation exists")
-
-	// Check that the annotation is set to true
 	if strings.Compare(strings.ToLower(val), "true") != 0 {
 		return ctrl.Result{}, nil
 	}
-	l.Info("annotation is true")
+
+	namespacedName := fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
 
 	// Create object manager that we use to manage DNS records in infoblox
 	objMgr := ibclient.NewObjectManager(r.conn, "", "")
 
 	// Exit early if Ingress doesn't have any IP addresses in its status field
 	if len(ingress.Status.LoadBalancer.Ingress) <= 0 {
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, fmt.Errorf("ingress %s doesn't have any IP addresses. Retrying in 10s", ingress.Name)
+		l.Info("ingress doesn't have any IP addresses. Retrying in 10s", "ingress", namespacedName)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	// Just use the first IP address in the list for now
@@ -142,10 +141,8 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	l.Info("test 1")
-	for _, host := range hosts {
 
-		l.Info("test 2")
+	for _, host := range hosts {
 
 		// Check if Host record exists. If it's not found then a new host record is created
 		// rec, err := objMgr.GetHostRecord(r.cfg.View, r.cfg.Zone, host, ipaddress, "")
@@ -175,14 +172,14 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					[]string{},
 				)
 				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("error creating host record %s: %v", host, err)
+					return ctrl.Result{}, fmt.Errorf("error creating host record %s for ingress %s: %v", host, namespacedName, err)
 				}
 				// Record was created, requeue so we can check again
 				return ctrl.Result{RequeueAfter: time.Minute}, nil
 			}
 
 			// Return the error if any other errors are returned
-			return ctrl.Result{}, fmt.Errorf("error fetching host %s: %v", host, err)
+			return ctrl.Result{}, fmt.Errorf("error fetching host %s for ingress %s: %v", host, namespacedName, err)
 		}
 
 		// Check so that we only get exactly 1 host record since two records pointing to the same ip address is probably a bad thing
@@ -199,7 +196,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				if err != nil {
 					return ctrl.Result{}, fmt.Errorf("error deleting host record %s: %v", host, err)
 				}
-				l.Info("deleted host record", "host", host, "ingress", fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name))
+				l.Info("deleted host record", "host", host, "ingress", namespacedName)
 
 				// Get the Project resource again so that we don't encounter any "the object has been modified"-errors
 				if err = r.Get(ctx, req.NamespacedName, ingress); err != nil {
@@ -238,7 +235,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("error updating host record %s: %v", host, err)
 		}
-		l.Info("updated host record %s on ingress %s", host, ingress.Name)
+		l.Info("updated host record successfully", "host", host, "ingress", namespacedName)
 
 	}
 
