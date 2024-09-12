@@ -37,8 +37,8 @@ spec:
             - "--health-probe-bind-address=:8081"
             - "--metrics-bind-address=127.0.0.1:8080"
             - "--leader-elect"
-            - --infoblox-server=$INFOBLOX_SERVER
-            - --infoblox-username=$INFOBLOX_USERNAME
-            - --infoblox-password=$INFOBLOX_PASSWORD
-            - --infoblox-view=$INFOBLOX_VIEW
-            - --infoblox-zone=$INFOBLOX_ZONE
+            - --infoblox-server=$(INFOBLOX_SERVER)
+            - --infoblox-username=$(INFOBLOX_USERNAME)
+            - --infoblox-password=$(INFOBLOX_PASSWORD)
+            - --infoblox-view=$(INFOBLOX_VIEW)
+            - --infoblox-zone=$(INFOBLOX_ZONE)

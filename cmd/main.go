@@ -167,6 +167,15 @@ func main() {
 		Version: infobloxVersion,
 	}
 
+	setupLog.Info("infoblox dns provider",
+		"version", infobloxVersion,
+		"server", infobloxServer,
+		"port", infobloxPort,
+		"username", infobloxUsername,
+		"view", infobloxView,
+		"zone", infobloxZone,
+	)
+
 	if err = (&controller.IngressReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),

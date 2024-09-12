@@ -90,6 +90,7 @@ spec:
                   key: INFOBLOX_VIEW
           image: controller:latest
           name: manager
+          imagePullPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
