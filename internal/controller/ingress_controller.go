@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -117,14 +118,8 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Check for presence of the annotation and that it's set to true
-	for _, a := range allowedAnnotations {
-		val, ok := ingress.Annotations[a]
-		if !ok {
-			return ctrl.Result{}, nil
-		}
-		if strings.Compare(strings.ToLower(val), "true") != 0 {
-			return ctrl.Result{}, nil
-		}
+	if !isManagedByController(ingress) {
+		return ctrl.Result{}, nil
 	}
 
 	namespacedName := fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
@@ -245,6 +240,20 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	return ctrl.Result{}, nil
+}
+
+func isManagedByController(ing *netv1.Ingress) bool {
+	var found bool
+
+	for k, v := range ing.Annotations {
+		if slices.Contains(allowedAnnotations, k) {
+			if strings.Compare(strings.ToLower(v), "true") != 0 {
+				found = true
+			}
+		}
+	}
+
+	return found
 }
 
 func getIngressHosts(ing *netv1.Ingress) ([]string, error) {
