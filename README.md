@@ -1,3 +1,5 @@
+[![Go](https://github.com/middlewaregruppen/infoblox-dns-controller/actions/workflows/go.yaml/badge.svg)](https://github.com/middlewaregruppen/infoblox-dns-controller/actions/workflows/go.yaml) [![Release](https://github.com/middlewaregruppen/infoblox-dns-controller/actions/workflows/release.yaml/badge.svg)](https://github.com/middlewaregruppen/infoblox-dns-controller/actions/workflows/release.yaml)
+
 # Infoblox DNS Controller
 
 Manage Host records in Infoblox DNS through Kubernetes Ingresses

@@ -26,10 +26,14 @@ import (
 
 	netv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	ibclient "github.com/infobloxopen/infoblox-go-client/v2"
 )
@@ -37,8 +41,9 @@ import (
 const ingressFinalizers = "infoblox-dns-controller.k8s.mdlwr.io/finalizer"
 
 var (
-	ErrObjectNotFound = errors.New("requested object not found")
-	ErrNotFound       = errors.New("not found")
+	ErrObjectNotFound   = errors.New("requested object not found")
+	ErrNotFound         = errors.New("not found")
+	ErrIngressWithoutIP = errors.New("ingress has no IP Address")
 
 	// Acceptable annotation keys
 	allowedAnnotations = []string{"dns-managed-by/infoblox-dns-webhook", "infoblox-dns-controller/manage"}
@@ -56,31 +61,6 @@ type InfobloxConfig struct {
 	View    string
 	Zone    string
 	Version string
-}
-
-// getHostRecord finds and returns a slice of all host records matching the provided ipv4 address.
-// We need this because the infoblox object manager library currently doesn't have a way of searching for host records by IP address.
-func getHostRecord(conn *ibclient.Connector, netview, dnsview, ipv4addr string) ([]ibclient.HostRecord, error) {
-	var res []ibclient.HostRecord
-
-	recordHost := ibclient.NewEmptyHostRecord()
-	sf := map[string]string{}
-
-	if netview != "" {
-		sf["network_view"] = netview
-	}
-	if dnsview != "" {
-		sf["view"] = dnsview
-	}
-	if ipv4addr != "" {
-		sf["ipv4addr"] = ipv4addr
-	}
-	queryParams := ibclient.NewQueryParams(false, sf)
-	err := conn.GetObject(recordHost, "", queryParams, &res)
-	if err != nil || res == nil || len(res) == 0 {
-		return nil, err
-	}
-	return res, err
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.io.my.domain,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
@@ -119,7 +99,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Check for presence of the annotation and that it's set to true
 	if !isManagedByController(ingress) {
-		l.Info("Not controlled by controller")
 		return ctrl.Result{}, nil
 	}
 
@@ -143,35 +122,18 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	var recs []*ibclient.HostRecord
+
 	for _, host := range hosts {
 
 		// Check if Host record exists. If it's not found then a new host record is created
-		// rec, err := objMgr.GetHostRecord(r.cfg.View, r.cfg.Zone, host, ipaddress, "")
-		recs, err := getHostRecord(r.conn, r.cfg.View, r.cfg.Zone, ipaddress)
+		rec, err := getHostRecord(objMgr, r.cfg, host, ipaddress)
 		if err != nil {
 
 			// Create record since it's not found
-			// if errors.Is(err, ErrNotFound) || errors.AIs(err, ErrObjectNotFound) {
 			var notfound *ibclient.NotFoundError
 			if errors.As(err, &notfound) {
-				_, err = objMgr.CreateHostRecord(
-					true,       // enabledns
-					false,      // enabledhcp
-					host,       // recordName
-					r.cfg.View, // DNS View
-					r.cfg.Zone, // DNS Zone
-					"",         // ipv4cidr
-					"",         // ipv6cidr
-					ipaddress,  // ipv4Addr
-					"",         // ipv6Addr
-					"",         // macAddr
-					"",
-					true, // useTTL
-					30,
-					"",
-					nil,
-					[]string{},
-				)
+				err = createHostRecord(objMgr, r.cfg, host, ipaddress)
 				if err != nil {
 					return ctrl.Result{}, fmt.Errorf("error creating host record %s for ingress %s: %v", host, namespacedName, err)
 				}
@@ -183,64 +145,92 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, fmt.Errorf("error fetching host %s for ingress %s: %v", host, namespacedName, err)
 		}
 
-		// Check so that we only get exactly 1 host record since two records pointing to the same ip address is probably a bad thing
-		if len(recs) > 1 {
-			return ctrl.Result{}, fmt.Errorf("multiple host records with IP address %s found. Manual intervention is required", ipaddress)
-		}
-		rec := recs[0]
-
-		// Check if resource is marked to be deleted
-		if ingress.GetDeletionTimestamp() != nil {
-			if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
-
-				_, err := r.conn.DeleteObject(rec.Ref)
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("error deleting host record %s: %v", host, err)
-				}
-				l.Info("deleted host record", "host", host, "ingress", namespacedName)
-
-				// Get the Project resource again so that we don't encounter any "the object has been modified"-errors
-				if err = r.Get(ctx, req.NamespacedName, ingress); err != nil {
-					return ctrl.Result{}, err
-				}
-				// Remove finalizers and update status field of the resource
-				if ok := controllerutil.RemoveFinalizer(ingress, ingressFinalizers); !ok {
-					return ctrl.Result{Requeue: true}, nil
-				}
-				if err := r.Update(ctx, ingress); err != nil {
-					return ctrl.Result{}, err
-				}
-			}
-			return ctrl.Result{}, nil
-		}
-
-		// Update the record since it already exists if we get here
-		_, err = objMgr.UpdateHostRecord(rec.Ref,
-			true,
-			false,
-			host,
-			r.cfg.View,
-			r.cfg.Zone,
-			"",
-			"",
-			ipaddress,
-			"",
-			"",
-			"",
-			true,
-			30,
-			"",
-			nil,
-			[]string{},
-		)
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("error updating host record %s: %v", host, err)
-		}
-		l.Info("updated host record successfully", "host", host, "ingress", namespacedName)
+		recs = append(recs, rec)
 
 	}
 
+	// Check if resource is marked to be deleted
+	if ingress.GetDeletionTimestamp() != nil {
+		if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
+
+			for _, rec := range recs {
+				_, err = r.conn.DeleteObject(rec.Ref)
+				if err != nil {
+					return ctrl.Result{}, fmt.Errorf("error deleting host record %s: %v", *rec.Name, err)
+				}
+				l.Info("deleted host record", "host", *rec.Name, "ingress", namespacedName)
+			}
+
+			// Get the Project resource again so that we don't encounter any "the object has been modified"-errors
+			if err = r.Get(ctx, req.NamespacedName, ingress); err != nil {
+				return ctrl.Result{}, err
+			}
+			// Remove finalizers and update status field of the resource
+			if ok := controllerutil.RemoveFinalizer(ingress, ingressFinalizers); !ok {
+				return ctrl.Result{Requeue: true}, nil
+			}
+			if err := r.Update(ctx, ingress); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
 	return ctrl.Result{}, nil
+}
+
+// getHostRecord finds and returns a slice of all host records matching the provided ipv4 address.
+// We need this because the infoblox object manager library currently doesn't have a way of searching for host records by IP address.
+func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ipv4addr string) (*ibclient.HostRecord, error) {
+	rec, err := objMgr.GetHostRecord(cfg.View, cfg.Zone, name, ipv4addr, "")
+	if err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress string) error {
+	_, err := objMgr.CreateHostRecord(
+		true,      // enabledns
+		false,     // enabledhcp
+		host,      // recordName
+		cfg.View,  // DNS View
+		cfg.Zone,  // DNS Zone
+		"",        // ipv4cidr
+		"",        // ipv6cidr
+		ipaddress, // ipv4Addr
+		"",        // ipv6Addr
+		"",        // macAddr
+		"",
+		true, // useTTL
+		30,
+		"",
+		nil,
+		[]string{},
+	)
+	return err
+}
+
+func updateHostRecord(objMgr ibclient.IBObjectManager, rec *ibclient.HostRecord, cfg *InfobloxConfig, host, ipaddress string) error {
+	_, err := objMgr.UpdateHostRecord(rec.Ref,
+		true,
+		false,
+		host,
+		cfg.View,
+		cfg.Zone,
+		"",
+		"",
+		ipaddress,
+		"",
+		"",
+		"",
+		true,
+		30,
+		"",
+		nil,
+		[]string{},
+	)
+	return err
 }
 
 func isManagedByController(ing *netv1.Ingress) bool {
@@ -262,11 +252,102 @@ func getIngressHosts(ing *netv1.Ingress) ([]string, error) {
 	return hosts, nil
 }
 
+func handleObject(obj client.Object) (*netv1.Ingress, error) {
+	ingress, ok := obj.(*netv1.Ingress)
+	if !ok {
+		return nil, fmt.Errorf("expected Ingress, but got %T", obj)
+	}
+	return ingress, nil
+}
+
+// Returns the first IP address in the Ingress status field.
+// Returns an ErrIngressWithoutIP if Ingress doens't have any IP addresses in its status field
+func mustHaveIPAddress(ing *netv1.Ingress) (string, error) {
+	// Exit early if Ingress doesn't have any IP addresses in its status field
+	if len(ing.Status.LoadBalancer.Ingress) <= 0 {
+		return "", ErrIngressWithoutIP
+	}
+
+	// Just use the first IP address in the list for now
+	return ing.Status.LoadBalancer.Ingress[0].IP, nil
+}
+
+func hostsToRemove(oldIng, newIng *netv1.Ingress) ([]string, error) {
+	var removed []string
+	oldHosts, err := getIngressHosts(oldIng)
+	if err != nil {
+		return nil, err
+	}
+	newHosts, err := getIngressHosts(newIng)
+	for _, oldHost := range oldHosts {
+		if !slices.Contains(newHosts, oldHost) {
+			removed = append(removed, oldHost)
+		}
+	}
+	return removed, err
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Connector, cfg *InfobloxConfig) error {
 	r.conn = conn
 	r.cfg = cfg
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&netv1.Ingress{}).
+		Watches(
+			&netv1.Ingress{},
+			&handler.Funcs{
+				CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.RateLimitingInterface) {
+					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+				},
+				UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.RateLimitingInterface) {
+					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.ObjectNew)})
+					l := log.FromContext(ctx)
+
+					oldIng, err := handleObject(e.ObjectOld)
+					if err != nil {
+						l.Error(err, "couldn't handle ObjectOld as Ingress")
+						return
+					}
+
+					newIng, err := handleObject(e.ObjectNew)
+					if err != nil {
+						l.Error(err, "couldn't handle ObjectNew as Ingress")
+						return
+					}
+
+					ip, err := mustHaveIPAddress(oldIng)
+					if err != nil {
+						l.Error(err, "couldn't get IP address from Ingress")
+						return
+					}
+
+					removed, err := hostsToRemove(oldIng, newIng)
+					if err != nil {
+						l.Error(err, "couldn't determin hosts to remove")
+						return
+					}
+
+					objMgr := ibclient.NewObjectManager(r.conn, "", "")
+
+					for _, remove := range removed {
+						rec, err := getHostRecord(objMgr, r.cfg, remove, ip)
+						if err != nil {
+							l.Error(err, "couldn't get host record")
+							return
+						}
+
+						_, err = r.conn.DeleteObject(rec.Ref)
+						if err != nil {
+							l.Error(err, "couldn't delete host record")
+							return
+						}
+					}
+				},
+				DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.RateLimitingInterface) {
+					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+				},
+			},
+		).
 		Complete(r)
 }
