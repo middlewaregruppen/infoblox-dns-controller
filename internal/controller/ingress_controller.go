@@ -35,6 +35,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+
 	ibclient "github.com/infobloxopen/infoblox-go-client/v2"
 )
 
@@ -47,6 +50,29 @@ var (
 
 	// Acceptable annotation keys
 	allowedAnnotations = []string{"dns-managed-by/infoblox-dns-webhook", "infoblox-dns-controller/manage"}
+
+	// Prometheus metrics
+	counterRecordsRetrieved = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "infoblox_records_retrieved_total",
+			Help: "Number of records retrieved from infoblox",
+		},
+		[]string{"type", "net_view", "dns_view", "host", "ipv4address", "ipv6address", "ingress_name"},
+	)
+	counterRecordsAdded = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "infoblox_records_added_total",
+			Help: "Number of records added",
+		},
+		[]string{"type", "net_view", "dns_view", "host", "ipv4address", "ipv6address", "ingress_name"},
+	)
+	counterRecordsRemoved = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "infoblox_records_removed_total",
+			Help: "Number of records removed",
+		},
+		[]string{"type", "net_view", "dns_view", "host", "ipv4address", "ipv6address", "ingress_name"},
+	)
 )
 
 // IngressReconciler reconciles a Ingress object
@@ -61,6 +87,10 @@ type InfobloxConfig struct {
 	View    string
 	Zone    string
 	Version string
+}
+
+func init() {
+	metrics.Registry.MustRegister(counterRecordsAdded, counterRecordsRemoved)
 }
 
 //+kubebuilder:rbac:groups=networking.k8s.io.my.domain,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
@@ -127,13 +157,13 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	for _, host := range hosts {
 
 		// Check if Host record exists. If it's not found then a new host record is created
-		rec, err := getHostRecord(objMgr, r.cfg, host, ipaddress)
+		rec, err := getHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name)
 		if err != nil {
 
 			// Create record since it's not found
 			var notfound *ibclient.NotFoundError
 			if errors.As(err, &notfound) {
-				err = createHostRecord(objMgr, r.cfg, host, ipaddress)
+				err = createHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name)
 				if err != nil {
 					return ctrl.Result{}, fmt.Errorf("error creating host record %s for ingress %s: %v", host, namespacedName, err)
 				}
@@ -181,15 +211,24 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 // getHostRecord finds and returns a slice of all host records matching the provided ipv4 address.
 // We need this because the infoblox object manager library currently doesn't have a way of searching for host records by IP address.
-func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ipv4addr string) (*ibclient.HostRecord, error) {
+func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ipv4addr, ingress string) (*ibclient.HostRecord, error) {
 	rec, err := objMgr.GetHostRecord(cfg.View, cfg.Zone, name, ipv4addr, "")
 	if err != nil {
 		return nil, err
 	}
+	counterRecordsRetrieved.With(prometheus.Labels{
+		"type":         "HOST",
+		"net_view":     cfg.View,
+		"dns_view":     cfg.Zone,
+		"host":         name,
+		"ipv4address":  ipv4addr,
+		"ipv6address":  "",
+		"ingress_name": ingress,
+	}).Inc()
 	return rec, nil
 }
 
-func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress string) error {
+func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress, ingress string) error {
 	_, err := objMgr.CreateHostRecord(
 		true,      // enabledns
 		false,     // enabledhcp
@@ -208,29 +247,34 @@ func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host
 		nil,
 		[]string{},
 	)
+
+	counterRecordsAdded.With(prometheus.Labels{
+		"type":         "HOST",
+		"net_view":     cfg.View,
+		"dns_view":     cfg.Zone,
+		"host":         host,
+		"ipv4address":  ipaddress,
+		"ipv6address":  "",
+		"ingress_name": ingress,
+	}).Inc()
 	return err
 }
 
-func updateHostRecord(objMgr ibclient.IBObjectManager, rec *ibclient.HostRecord, cfg *InfobloxConfig, host, ipaddress string) error {
-	_, err := objMgr.UpdateHostRecord(rec.Ref,
-		true,
-		false,
-		host,
-		cfg.View,
-		cfg.Zone,
-		"",
-		"",
-		ipaddress,
-		"",
-		"",
-		"",
-		true,
-		30,
-		"",
-		nil,
-		[]string{},
-	)
-	return err
+func deleteHostRecord(conn *ibclient.Connector, rec *ibclient.HostRecord, cfg *InfobloxConfig, host, ipaddress, ingress string) error {
+	_, err := conn.DeleteObject(rec.Ref)
+	if err != nil {
+		return err
+	}
+	counterRecordsRemoved.With(prometheus.Labels{
+		"type":         "HOST",
+		"net_view":     cfg.View,
+		"dns_view":     cfg.Zone,
+		"host":         host,
+		"ipv4address":  ipaddress,
+		"ipv6address":  "",
+		"ingress_name": ingress,
+	}).Inc()
+	return nil
 }
 
 func isManagedByController(ing *netv1.Ingress) bool {
@@ -331,13 +375,13 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 					objMgr := ibclient.NewObjectManager(r.conn, "", "")
 
 					for _, remove := range removed {
-						rec, err := getHostRecord(objMgr, r.cfg, remove, ip)
+						rec, err := getHostRecord(objMgr, r.cfg, remove, ip, oldIng.Name)
 						if err != nil {
 							l.Error(err, "couldn't get host record")
 							return
 						}
 
-						_, err = r.conn.DeleteObject(rec.Ref)
+						err = deleteHostRecord(r.conn, rec, cfg, remove, ip, oldIng.Name)
 						if err != nil {
 							l.Error(err, "couldn't delete host record")
 							return
