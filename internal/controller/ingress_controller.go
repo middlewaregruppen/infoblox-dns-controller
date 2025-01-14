@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,6 +67,13 @@ var (
 		},
 		[]string{"type", "net_view", "dns_view", "host", "ipv4address", "ipv6address", "ingress_name"},
 	)
+	counterRecordsUpdated = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "infoblox_records_updated_total",
+			Help: "Number of records updated",
+		},
+		[]string{"type", "net_view", "dns_view", "host", "ipv4address", "ipv6address", "ingress_name"},
+	)
 	counterRecordsRemoved = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "infoblox_records_removed_total",
@@ -84,9 +92,10 @@ type IngressReconciler struct {
 }
 
 type InfobloxConfig struct {
-	View    string
-	Zone    string
-	Version string
+	View        string
+	Zone        string
+	Version     string
+	AliasSuffix string
 }
 
 func init() {
@@ -152,10 +161,22 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
+	// Check for aliases
+	var serverAliases []string
+	for key, val := range ingress.Annotations {
+		// Check for this annotation: nginx.ingress.kubernetes.io/server-alias. Only applicable for Nginx
+		if strings.Contains(key, "server-alias") {
+			serverAliases = strings.Split(val, ",")
+
+			for i, alias := range serverAliases {
+				serverAliases[i] = strings.TrimSpace(alias)
+			}
+		}
+	}
+
 	var recs []*ibclient.HostRecord
 
 	for _, host := range hosts {
-
 		// Check if Host record exists. If it's not found then a new host record is created
 		rec, err := getHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name)
 		if err != nil {
@@ -163,7 +184,9 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			// Create record since it's not found
 			var notfound *ibclient.NotFoundError
 			if errors.As(err, &notfound) {
-				err = createHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name)
+				l.Info("Creating host record", "ingress", namespacedName, "host", host, "aliases", serverAliases)
+
+				err = createHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name, serverAliases)
 				if err != nil {
 					return ctrl.Result{}, fmt.Errorf("error creating host record %s for ingress %s: %v", host, namespacedName, err)
 				}
@@ -175,8 +198,18 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, fmt.Errorf("error fetching host %s for ingress %s: %v", host, namespacedName, err)
 		}
 
-		recs = append(recs, rec)
+		if !alisesAreEqual(rec.Aliases, serverAliases) {
+			l.Info("Updating host record", "ingress", namespacedName, "host", host, "aliases", serverAliases)
 
+			err = updateHostRecord(objMgr, r.cfg, rec.Ref, host, ipaddress, ingress.Name, serverAliases)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("error creating host record %s for ingress %s: %v", host, namespacedName, err)
+			}
+			// Record was created, requeue so we can check again
+			return ctrl.Result{RequeueAfter: time.Minute}, nil
+		}
+
+		recs = append(recs, rec)
 	}
 
 	// Check if resource is marked to be deleted
@@ -212,14 +245,14 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 // getHostRecord finds and returns a slice of all host records matching the provided ipv4 address.
 // We need this because the infoblox object manager library currently doesn't have a way of searching for host records by IP address.
 func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ipv4addr, ingress string) (*ibclient.HostRecord, error) {
-	rec, err := objMgr.GetHostRecord(cfg.View, cfg.Zone, name, ipv4addr, "")
+	rec, err := objMgr.GetHostRecord("", cfg.View, name, ipv4addr, "")
 	if err != nil {
 		return nil, err
 	}
 	counterRecordsRetrieved.With(prometheus.Labels{
 		"type":         "HOST",
-		"net_view":     cfg.View,
-		"dns_view":     cfg.Zone,
+		"net_view":     "",
+		"dns_view":     cfg.View,
 		"host":         name,
 		"ipv4address":  ipv4addr,
 		"ipv6address":  "",
@@ -228,13 +261,13 @@ func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, i
 	return rec, nil
 }
 
-func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress, ingress string) error {
+func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress, ingress string, aliases []string) error {
 	_, err := objMgr.CreateHostRecord(
 		true,      // enabledns
 		false,     // enabledhcp
 		host,      // recordName
-		cfg.View,  // DNS View
-		cfg.Zone,  // DNS Zone
+		"",        // DNS View
+		cfg.View,  // DNS Zone
 		"",        // ipv4cidr
 		"",        // ipv6cidr
 		ipaddress, // ipv4Addr
@@ -245,10 +278,45 @@ func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host
 		30,
 		"",
 		nil,
-		[]string{},
+		aliases,
+		false,
 	)
 
 	counterRecordsAdded.With(prometheus.Labels{
+		"type":         "HOST",
+		"net_view":     cfg.View,
+		"dns_view":     cfg.Zone,
+		"host":         host,
+		"ipv4address":  ipaddress,
+		"ipv6address":  "",
+		"ingress_name": ingress,
+	}).Inc()
+	return err
+}
+
+func updateHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, hostRef string, host, ipaddress, ingress string, aliases []string) error {
+	_, err := objMgr.UpdateHostRecord(
+		hostRef,
+		true,      // enabledns
+		false,     // enabledhcp
+		host,      // recordName
+		"",        // DNS View
+		cfg.View,  // DNS Zone
+		"",        // ipv4cidr
+		"",        // ipv6cidr
+		ipaddress, // ipv4Addr
+		"",        // ipv6Addr
+		"",        // macAddr
+		"",
+		true, // useTTL
+		30,
+		"",
+		nil,
+		aliases,
+		false,
+	)
+
+	counterRecordsUpdated.With(prometheus.Labels{
 		"type":         "HOST",
 		"net_view":     cfg.View,
 		"dns_view":     cfg.Zone,
@@ -267,8 +335,8 @@ func deleteHostRecord(conn *ibclient.Connector, rec *ibclient.HostRecord, cfg *I
 	}
 	counterRecordsRemoved.With(prometheus.Labels{
 		"type":         "HOST",
-		"net_view":     cfg.View,
-		"dns_view":     cfg.Zone,
+		"net_view":     "",
+		"dns_view":     cfg.View,
 		"host":         host,
 		"ipv4address":  ipaddress,
 		"ipv6address":  "",
@@ -331,6 +399,26 @@ func hostsToRemove(oldIng, newIng *netv1.Ingress) ([]string, error) {
 	return removed, err
 }
 
+func alisesAreEqual(existingAliases, serverAliases []string) bool {
+	if len(existingAliases) != len(serverAliases) {
+		return false
+	}
+
+	ea := append([]string(nil), existingAliases...)
+	sa := append([]string(nil), serverAliases...)
+
+	sort.Strings(ea)
+	sort.Strings(sa)
+
+	for i := range ea {
+		if ea[i] != sa[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Connector, cfg *InfobloxConfig) error {
 	r.conn = conn
@@ -340,58 +428,54 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 		For(&netv1.Ingress{}).
 		Watches(
 			&netv1.Ingress{},
-			&handler.Funcs{
-				CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.RateLimitingInterface) {
-					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
-				},
-				UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.RateLimitingInterface) {
-					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.ObjectNew)})
-					l := log.FromContext(ctx)
+			&handler.Funcs{CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+			}, UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.ObjectNew)})
+				l := log.FromContext(ctx)
 
-					oldIng, err := handleObject(e.ObjectOld)
+				oldIng, err := handleObject(e.ObjectOld)
+				if err != nil {
+					l.Error(err, "couldn't handle ObjectOld as Ingress")
+					return
+				}
+
+				newIng, err := handleObject(e.ObjectNew)
+				if err != nil {
+					l.Error(err, "couldn't handle ObjectNew as Ingress")
+					return
+				}
+
+				ip, err := mustHaveIPAddress(oldIng)
+				if err != nil {
+					l.Error(err, "couldn't get IP address from Ingress")
+					return
+				}
+
+				removed, err := hostsToRemove(oldIng, newIng)
+				if err != nil {
+					l.Error(err, "couldn't determin hosts to remove")
+					return
+				}
+
+				objMgr := ibclient.NewObjectManager(r.conn, "", "")
+
+				for _, remove := range removed {
+					rec, err := getHostRecord(objMgr, r.cfg, remove, ip, oldIng.Name)
 					if err != nil {
-						l.Error(err, "couldn't handle ObjectOld as Ingress")
+						l.Error(err, "couldn't get host record")
 						return
 					}
 
-					newIng, err := handleObject(e.ObjectNew)
+					err = deleteHostRecord(r.conn, rec, cfg, remove, ip, oldIng.Name)
 					if err != nil {
-						l.Error(err, "couldn't handle ObjectNew as Ingress")
+						l.Error(err, "couldn't delete host record")
 						return
 					}
-
-					ip, err := mustHaveIPAddress(oldIng)
-					if err != nil {
-						l.Error(err, "couldn't get IP address from Ingress")
-						return
-					}
-
-					removed, err := hostsToRemove(oldIng, newIng)
-					if err != nil {
-						l.Error(err, "couldn't determin hosts to remove")
-						return
-					}
-
-					objMgr := ibclient.NewObjectManager(r.conn, "", "")
-
-					for _, remove := range removed {
-						rec, err := getHostRecord(objMgr, r.cfg, remove, ip, oldIng.Name)
-						if err != nil {
-							l.Error(err, "couldn't get host record")
-							return
-						}
-
-						err = deleteHostRecord(r.conn, rec, cfg, remove, ip, oldIng.Name)
-						if err != nil {
-							l.Error(err, "couldn't delete host record")
-							return
-						}
-					}
-				},
-				DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.RateLimitingInterface) {
-					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
-				},
-			},
+				}
+			}, DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+			}},
 		).
 		Complete(r)
 }
