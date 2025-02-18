@@ -125,6 +125,11 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Check for presence of the annotation and that it's set to true
+	if !isManagedByController(ingress) {
+		return ctrl.Result{}, nil
+	}
+
 	// Add finalizers that will be handled later during delete events
 	if !controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
 		l.Info("adding finalizer", "ingress", ingress.Name)
@@ -134,11 +139,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Update(ctx, ingress); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
-
-	// Check for presence of the annotation and that it's set to true
-	if !isManagedByController(ingress) {
-		return ctrl.Result{}, nil
 	}
 
 	namespacedName := fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
@@ -178,7 +178,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	for _, host := range hosts {
 		// Check if Host record exists. If it's not found then a new host record is created
-		rec, err := getHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name)
+		rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
 		if err != nil {
 
 			// Create record since it's not found
@@ -198,8 +198,10 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			return ctrl.Result{}, fmt.Errorf("error fetching host %s for ingress %s: %v", host, namespacedName, err)
 		}
 
-		if !alisesAreEqual(rec.Aliases, serverAliases) {
-			l.Info("Updating host record", "ingress", namespacedName, "host", host, "aliases", serverAliases)
+		hostRecordIp, err := objMgr.GetIpAddressFromHostRecord(*rec)
+
+		if !alisesAreEqual(rec.Aliases, serverAliases) || hostRecordIp != ipaddress {
+			l.Info("Updating host record", "ingress", namespacedName, "host", host, "ip", ipaddress, "aliases", serverAliases)
 
 			err = updateHostRecord(objMgr, r.cfg, rec.Ref, host, ipaddress, ingress.Name, serverAliases)
 			if err != nil {
@@ -244,8 +246,8 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 // getHostRecord finds and returns a slice of all host records matching the provided ipv4 address.
 // We need this because the infoblox object manager library currently doesn't have a way of searching for host records by IP address.
-func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ipv4addr, ingress string) (*ibclient.HostRecord, error) {
-	rec, err := objMgr.GetHostRecord("", cfg.View, name, ipv4addr, "")
+func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ingress string) (*ibclient.HostRecord, error) {
+	rec, err := objMgr.GetHostRecord("", cfg.View, name, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +256,7 @@ func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, i
 		"net_view":     "",
 		"dns_view":     cfg.View,
 		"host":         name,
-		"ipv4address":  ipv4addr,
+		"ipv4address":  "",
 		"ipv6address":  "",
 		"ingress_name": ingress,
 	}).Inc()
@@ -348,12 +350,12 @@ func deleteHostRecord(conn *ibclient.Connector, rec *ibclient.HostRecord, cfg *I
 func isManagedByController(ing *netv1.Ingress) bool {
 	for k, v := range ing.Annotations {
 		if slices.Contains(allowedAnnotations, k) {
-			if strings.Compare(strings.ToLower(v), "true") != 0 {
+			if strings.EqualFold(v, "true") {
 				return true
 			}
 		}
 	}
-	return true
+	return false
 }
 
 func getIngressHosts(ing *netv1.Ingress) ([]string, error) {
@@ -461,7 +463,7 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 				objMgr := ibclient.NewObjectManager(r.conn, "", "")
 
 				for _, remove := range removed {
-					rec, err := getHostRecord(objMgr, r.cfg, remove, ip, oldIng.Name)
+					rec, err := getHostRecord(objMgr, r.cfg, remove, oldIng.Name)
 					if err != nil {
 						l.Error(err, "couldn't get host record")
 						return
