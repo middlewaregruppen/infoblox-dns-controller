@@ -99,155 +99,225 @@ type InfobloxConfig struct {
 }
 
 func init() {
-	metrics.Registry.MustRegister(counterRecordsAdded, counterRecordsRemoved)
+	metrics.Registry.MustRegister(
+		counterRecordsRetrieved,
+		counterRecordsAdded,
+		counterRecordsRemoved,
+		counterRecordsUpdated,
+	)
 }
 
-//+kubebuilder:rbac:groups=networking.k8s.io.my.domain,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=networking.k8s.io.my.domain,resources=ingresses/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=networking.k8s.io.my.domain,resources=ingresses/finalizers,verbs=update
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Ingress object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.17.3/pkg/reconcile
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	l := log.FromContext(ctx)
+	l := log.FromContext(ctx).WithValues("ingress", req.NamespacedName)
 
-	// Fetch Ingress - This ensures that the cluster has resources of type Ingress
-	// Stops reconciliation if not found, for example if the CRD's has not been applied
 	ingress := &netv1.Ingress{}
 	if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Check for presence of the annotation and that it's set to true
 	if !isManagedByController(ingress) {
-		return ctrl.Result{}, nil
-	}
-
-	// Add finalizers that will be handled later during delete events
-	if !controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
-		l.Info("adding finalizer", "ingress", ingress.Name)
-		if ok := controllerutil.AddFinalizer(ingress, ingressFinalizers); !ok {
-			return ctrl.Result{Requeue: true}, nil
-		}
-		if err := r.Update(ctx, ingress); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
-	namespacedName := fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
-
-	// Create object manager that we use to manage DNS records in infoblox
-	objMgr := ibclient.NewObjectManager(r.conn, "", "")
-
-	// Exit early if Ingress doesn't have any IP addresses in its status field
-	if len(ingress.Status.LoadBalancer.Ingress) <= 0 {
-		l.Info("ingress doesn't have any IP addresses. Retrying in 10s", "ingress", namespacedName)
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
-	}
-
-	// Just use the first IP address in the list for now
-	ipaddress := ingress.Status.LoadBalancer.Ingress[0].IP
-
-	// Get a list of Hosts in the ingress
-	hosts, err := getIngressHosts(ingress)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Check for aliases
-	var serverAliases []string
-	for key, val := range ingress.Annotations {
-		// Check for this annotation: nginx.ingress.kubernetes.io/server-alias. Only applicable for Nginx
-		if strings.Contains(key, "server-alias") {
-			serverAliases = strings.Split(val, ",")
-
-			for i, alias := range serverAliases {
-				serverAliases[i] = strings.TrimSpace(alias)
-			}
-		}
-	}
-
-	var recs []*ibclient.HostRecord
-
-	for _, host := range hosts {
-		// Check if Host record exists. If it's not found then a new host record is created
-		rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
-		if err != nil {
-
-			// Create record since it's not found
-			var notfound *ibclient.NotFoundError
-			if errors.As(err, &notfound) {
-				l.Info("Creating host record", "ingress", namespacedName, "host", host, "aliases", serverAliases)
-
-				err = createHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name, serverAliases)
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("error creating host record %s for ingress %s: %v", host, namespacedName, err)
-				}
-				// Record was created, requeue so we can check again
-				return ctrl.Result{RequeueAfter: time.Minute}, nil
-			}
-
-			// Return the error if any other errors are returned
-			return ctrl.Result{}, fmt.Errorf("error fetching host %s for ingress %s: %v", host, namespacedName, err)
-		}
-
-		hostRecordIp, err := objMgr.GetIpAddressFromHostRecord(*rec)
-
-		if !alisesAreEqual(rec.Aliases, serverAliases) || hostRecordIp != ipaddress {
-			l.Info("Updating host record", "ingress", namespacedName, "host", host, "ip", ipaddress, "aliases", serverAliases)
-
-			err = updateHostRecord(objMgr, r.cfg, rec.Ref, host, ipaddress, ingress.Name, serverAliases)
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("error creating host record %s for ingress %s: %v", host, namespacedName, err)
-			}
-			// Record was created, requeue so we can check again
-			return ctrl.Result{RequeueAfter: time.Minute}, nil
-		}
-
-		recs = append(recs, rec)
-	}
-
-	// Check if resource is marked to be deleted
-	if ingress.GetDeletionTimestamp() != nil {
+		l.V(1).Info("Ingress is not managed by this controller, skipping")
 		if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
-
-			for _, rec := range recs {
-				_, err = r.conn.DeleteObject(rec.Ref)
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("error deleting host record %s: %v", *rec.Name, err)
-				}
-				l.Info("deleted host record", "host", *rec.Name, "ingress", namespacedName)
+			l.Info("Removing finalizer from unmanaged ingress")
+			if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
 			}
-
-			// Get the Project resource again so that we don't encounter any "the object has been modified"-errors
-			if err = r.Get(ctx, req.NamespacedName, ingress); err != nil {
-				return ctrl.Result{}, err
-			}
-			// Remove finalizers and update status field of the resource
 			if ok := controllerutil.RemoveFinalizer(ingress, ingressFinalizers); !ok {
+				l.Info("Finalizer already removed or conflict during removal, retrying")
 				return ctrl.Result{Requeue: true}, nil
 			}
 			if err := r.Update(ctx, ingress); err != nil {
+				l.Error(err, "Failed to remove finalizer from unmanaged ingress")
 				return ctrl.Result{}, err
 			}
 		}
 		return ctrl.Result{}, nil
 	}
 
+	l.V(1).Info("Reconciling managed ingress")
+
+	objMgr := ibclient.NewObjectManager(r.conn, "", "")
+
+	if ingress.GetDeletionTimestamp() != nil {
+		if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
+			l.Info("Handling deletion for ingress")
+
+			var lastKnownHosts []string
+			var ipAddressForDeletion string
+
+			if len(ingress.Status.LoadBalancer.Ingress) > 0 {
+				ipAddressForDeletion = ingress.Status.LoadBalancer.Ingress[0].IP
+			}
+
+			currentHosts, err := getIngressHosts(ingress)
+			if err != nil {
+				l.Error(err, "Could not get hosts from ingress spec during deletion, proceeding without host list")
+			} else {
+				lastKnownHosts = currentHosts
+			}
+
+			deletionErrors := false
+			for _, host := range lastKnownHosts {
+				rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
+				if err != nil {
+					var notfound *ibclient.NotFoundError
+					if errors.As(err, &notfound) {
+						l.Info("Host record not found during deletion, skipping", "host", host)
+						continue
+					}
+					l.Error(err, "Failed to get host record for deletion", "host", host)
+					deletionErrors = true
+					continue
+				}
+
+				l.Info("Attempting to delete host record", "host", host)
+				err = deleteHostRecord(r.conn, rec, r.cfg, host, ipAddressForDeletion, ingress.Name)
+				if err != nil {
+					l.Error(err, "Failed to delete host record", "host", host)
+					deletionErrors = true
+				} else {
+					l.Info("Successfully deleted host record", "host", host)
+				}
+			}
+
+			if !deletionErrors {
+				l.Info("All known host records handled for deletion, removing finalizer")
+				if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
+					if client.IgnoreNotFound(err) == nil {
+						l.Info("Ingress already deleted, finalizer removal likely succeeded or is irrelevant")
+						return ctrl.Result{}, nil
+					}
+					l.Error(err, "Failed to re-fetch ingress before removing finalizer")
+					return ctrl.Result{}, err
+				}
+				if controllerutil.RemoveFinalizer(ingress, ingressFinalizers) {
+					if err := r.Update(ctx, ingress); err != nil {
+						l.Error(err, "Failed to remove finalizer")
+						return ctrl.Result{}, err
+					}
+					l.Info("Finalizer removed")
+				} else {
+					l.Info("Finalizer already removed or conflict, reconciliation likely complete")
+				}
+			} else {
+				l.Error(nil, "Errors occurred during host record deletion, finalizer not removed, requeuing")
+				return ctrl.Result{Requeue: true}, nil
+			}
+		}
+		return ctrl.Result{}, nil
+	}
+
+	if !controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
+		l.Info("Adding finalizer")
+		if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
+			l.Error(err, "Failed to re-fetch ingress before adding finalizer")
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+		if ok := controllerutil.AddFinalizer(ingress, ingressFinalizers); !ok {
+			l.Info("Finalizer already present or conflict during add, retrying")
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if err := r.Update(ctx, ingress); err != nil {
+			l.Error(err, "Failed to add finalizer")
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	if len(ingress.Status.LoadBalancer.Ingress) == 0 || ingress.Status.LoadBalancer.Ingress[0].IP == "" {
+		l.Info("Ingress does not have an IP address yet. Retrying in 30s")
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	ipaddress := ingress.Status.LoadBalancer.Ingress[0].IP
+
+	desiredHosts, err := getIngressHosts(ingress)
+	if err != nil {
+		l.Error(err, "Failed to get hosts from ingress spec")
+		return ctrl.Result{}, err
+	}
+
+	serverAliases := getIngressAliases(ingress)
+
+	var encounteredError error
+	requeueNeeded := false
+
+	for _, host := range desiredHosts {
+		l := l.WithValues("host", host)
+
+		rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
+		if err != nil {
+			var notfound *ibclient.NotFoundError
+			if errors.As(err, &notfound) {
+				l.Info("Creating host record", "ip", ipaddress, "aliases", serverAliases)
+				err = createHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name, serverAliases)
+				if err != nil {
+					l.Error(err, "Failed to create host record")
+					if encounteredError == nil {
+						encounteredError = fmt.Errorf("failed to create host record %s: %w", host, err)
+					}
+				} else {
+					l.Info("Successfully created host record")
+					requeueNeeded = true
+				}
+				continue
+			} else {
+				l.Error(err, "Failed to get host record from Infoblox")
+				if encounteredError == nil {
+					encounteredError = fmt.Errorf("failed to get host record %s: %w", host, err)
+				}
+				continue
+			}
+		}
+
+		hostRecordIp, err := objMgr.GetIpAddressFromHostRecord(*rec)
+		if err != nil {
+			l.Error(err, "Failed to get IP address from existing host record", "recordRef", rec.Ref)
+			if encounteredError == nil {
+				encounteredError = fmt.Errorf("failed to get IP from host record %s: %w", host, err)
+			}
+			continue
+		}
+
+		if !alisesAreEqual(rec.Aliases, serverAliases) || hostRecordIp != ipaddress {
+			l.Info("Updating host record", "oldIp", hostRecordIp, "newIp", ipaddress, "oldAliases", rec.Aliases, "newAliases", serverAliases)
+			err = updateHostRecord(objMgr, r.cfg, rec.Ref, host, ipaddress, ingress.Name, serverAliases)
+			if err != nil {
+				l.Error(err, "Failed to update host record")
+				if encounteredError == nil {
+					encounteredError = fmt.Errorf("failed to update host record %s: %w", host, err)
+				}
+			} else {
+				l.Info("Successfully updated host record")
+				requeueNeeded = true
+			}
+		} else {
+			l.V(1).Info("Host record is up-to-date")
+		}
+	}
+
+	if encounteredError != nil {
+		l.Error(encounteredError, "Errors occurred during reconciliation, requeuing")
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if requeueNeeded {
+		l.Info("Requeueing shortly to verify changes")
+		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+	}
+
+	l.V(1).Info("Reconciliation complete")
 	return ctrl.Result{}, nil
 }
 
-// getHostRecord finds and returns a slice of all host records matching the provided ipv4 address.
-// We need this because the infoblox object manager library currently doesn't have a way of searching for host records by IP address.
-func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ingress string) (*ibclient.HostRecord, error) {
-	rec, err := objMgr.GetHostRecord("", cfg.View, name, "", "")
+// getHostRecord finds and returns a host record by name.
+func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ingressName string) (*ibclient.HostRecord, error) {
+	fqdn := name
+	rec, err := objMgr.GetHostRecord(fqdn, cfg.View, "", "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -255,100 +325,120 @@ func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, i
 		"type":         "HOST",
 		"net_view":     "",
 		"dns_view":     cfg.View,
-		"host":         name,
+		"host":         fqdn,
 		"ipv4address":  "",
 		"ipv6address":  "",
-		"ingress_name": ingress,
+		"ingress_name": ingressName,
 	}).Inc()
 	return rec, nil
 }
 
-func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress, ingress string, aliases []string) error {
+// createHostRecord creates a new host record using the original signature.
+func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress, ingressName string, aliases []string) error {
+	fqdn := host
+	ttl := uint32(30)
+
 	_, err := objMgr.CreateHostRecord(
 		true,      // enabledns
 		false,     // enabledhcp
-		host,      // recordName
-		"",        // DNS View
-		cfg.View,  // DNS Zone
+		fqdn,      // recordName
+		"",        // DNS View (Ensure this matches original intent)
+		cfg.View,  // DNS Zone (Ensure this matches original intent, likely cfg.View or cfg.Zone)
 		"",        // ipv4cidr
 		"",        // ipv6cidr
 		ipaddress, // ipv4Addr
 		"",        // ipv6Addr
 		"",        // macAddr
-		"",
-		true, // useTTL
-		30,
-		"",
-		nil,
-		aliases,
-		false,
+		"",        // comment
+		true,      // useTTL
+		ttl,       // ttl
+		"",        // eaSearch
+		nil,       // eas
+		aliases,   // aliases
+		false,     // useForExtData
 	)
 
-	counterRecordsAdded.With(prometheus.Labels{
-		"type":         "HOST",
-		"net_view":     cfg.View,
-		"dns_view":     cfg.Zone,
-		"host":         host,
-		"ipv4address":  ipaddress,
-		"ipv6address":  "",
-		"ingress_name": ingress,
-	}).Inc()
+	if err == nil {
+		// Ensure labels match the parameters used in the call
+		counterRecordsAdded.With(prometheus.Labels{
+			"type":         "HOST",
+			"net_view":     "",       // Reflects "" used for DNS View param
+			"dns_view":     cfg.View, // Reflects cfg.View used for DNS Zone param
+			"host":         fqdn,
+			"ipv4address":  ipaddress,
+			"ipv6address":  "",
+			"ingress_name": ingressName,
+		}).Inc()
+	}
 	return err
 }
 
-func updateHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, hostRef string, host, ipaddress, ingress string, aliases []string) error {
+// updateHostRecord updates an existing host record using the original signature pattern.
+func updateHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, hostRef string, host, ipaddress, ingressName string, aliases []string) error {
+	fqdn := host
+	ttl := uint32(30)
+
 	_, err := objMgr.UpdateHostRecord(
-		hostRef,
+		hostRef,   // ref
 		true,      // enabledns
 		false,     // enabledhcp
-		host,      // recordName
-		"",        // DNS View
-		cfg.View,  // DNS Zone
+		fqdn,      // recordName
+		"",        // DNS View (Ensure this matches original intent)
+		cfg.View,  // DNS Zone (Ensure this matches original intent, likely cfg.View or cfg.Zone)
 		"",        // ipv4cidr
 		"",        // ipv6cidr
 		ipaddress, // ipv4Addr
 		"",        // ipv6Addr
 		"",        // macAddr
-		"",
-		true, // useTTL
-		30,
-		"",
-		nil,
-		aliases,
-		false,
+		"",        // comment
+		true,      // useTTL
+		ttl,       // ttl
+		"",        // eaSearch
+		nil,       // eas
+		aliases,   // aliases
+		false,     // useForExtData
 	)
 
-	counterRecordsUpdated.With(prometheus.Labels{
-		"type":         "HOST",
-		"net_view":     cfg.View,
-		"dns_view":     cfg.Zone,
-		"host":         host,
-		"ipv4address":  ipaddress,
-		"ipv6address":  "",
-		"ingress_name": ingress,
-	}).Inc()
+	if err == nil {
+		// Ensure labels match the parameters used in the call
+		counterRecordsUpdated.With(prometheus.Labels{
+			"type":         "HOST",
+			"net_view":     "",       // Reflects "" used for DNS View param
+			"dns_view":     cfg.View, // Reflects cfg.View used for DNS Zone param
+			"host":         fqdn,
+			"ipv4address":  ipaddress,
+			"ipv6address":  "",
+			"ingress_name": ingressName,
+		}).Inc()
+	}
 	return err
 }
 
-func deleteHostRecord(conn *ibclient.Connector, rec *ibclient.HostRecord, cfg *InfobloxConfig, host, ipaddress, ingress string) error {
-	_, err := conn.DeleteObject(rec.Ref)
-	if err != nil {
-		return err
+// deleteHostRecord deletes a host record by its reference.
+func deleteHostRecord(conn *ibclient.Connector, rec *ibclient.HostRecord, cfg *InfobloxConfig, host, ipaddress, ingressName string) error {
+	ref := rec.Ref
+	_, err := conn.DeleteObject(ref)
+	if err == nil {
+		counterRecordsRemoved.With(prometheus.Labels{
+			"type":         "HOST",
+			"net_view":     "",
+			"dns_view":     cfg.View,
+			"host":         host,
+			"ipv4address":  ipaddress,
+			"ipv6address":  "",
+			"ingress_name": ingressName,
+		}).Inc()
 	}
-	counterRecordsRemoved.With(prometheus.Labels{
-		"type":         "HOST",
-		"net_view":     "",
-		"dns_view":     cfg.View,
-		"host":         host,
-		"ipv4address":  ipaddress,
-		"ipv6address":  "",
-		"ingress_name": ingress,
-	}).Inc()
-	return nil
+	return err
 }
 
+// isManagedByController checks for the presence of specific annotations.
 func isManagedByController(ing *netv1.Ingress) bool {
-	for k, v := range ing.Annotations {
+	annotations := ing.GetAnnotations()
+	if annotations == nil {
+		return false
+	}
+	for k, v := range annotations {
 		if slices.Contains(allowedAnnotations, k) {
 			if strings.EqualFold(v, "true") {
 				return true
@@ -358,52 +448,82 @@ func isManagedByController(ing *netv1.Ingress) bool {
 	return false
 }
 
+// getIngressHosts extracts hostnames from ingress rules.
 func getIngressHosts(ing *netv1.Ingress) ([]string, error) {
 	var hosts []string
+	if ing.Spec.Rules == nil {
+		return hosts, nil
+	}
 	for _, rule := range ing.Spec.Rules {
-		hosts = append(hosts, rule.Host)
+		if rule.Host != "" {
+			hosts = append(hosts, rule.Host)
+		}
 	}
 	return hosts, nil
 }
 
-func handleObject(obj client.Object) (*netv1.Ingress, error) {
-	ingress, ok := obj.(*netv1.Ingress)
-	if !ok {
-		return nil, fmt.Errorf("expected Ingress, but got %T", obj)
+// getIngressAliases extracts server aliases from common annotations.
+func getIngressAliases(ing *netv1.Ingress) []string {
+	var serverAliases []string
+	annotations := ing.GetAnnotations()
+	if annotations == nil {
+		return serverAliases
 	}
-	return ingress, nil
-}
-
-// Returns the first IP address in the Ingress status field.
-// Returns an ErrIngressWithoutIP if Ingress doens't have any IP addresses in its status field
-func mustHaveIPAddress(ing *netv1.Ingress) (string, error) {
-	// Exit early if Ingress doesn't have any IP addresses in its status field
-	if len(ing.Status.LoadBalancer.Ingress) <= 0 {
-		return "", ErrIngressWithoutIP
+	aliasAnnotationKeys := []string{
+		"nginx.ingress.kubernetes.io/server-alias",
+		"haproxy-ingress.github.io/server-alias",
+		"infoblox-dns-controller/aliases",
 	}
 
-	// Just use the first IP address in the list for now
-	return ing.Status.LoadBalancer.Ingress[0].IP, nil
+	for _, key := range aliasAnnotationKeys {
+		if val, ok := annotations[key]; ok {
+			aliases := strings.Split(val, ",")
+			for _, alias := range aliases {
+				trimmedAlias := strings.TrimSpace(alias)
+				if trimmedAlias != "" {
+					serverAliases = append(serverAliases, trimmedAlias)
+				}
+			}
+			if len(serverAliases) > 0 {
+				break
+			}
+		}
+	}
+	return serverAliases
 }
 
+// hostsToRemove compares host lists between old and new Ingress objects.
 func hostsToRemove(oldIng, newIng *netv1.Ingress) ([]string, error) {
 	var removed []string
 	oldHosts, err := getIngressHosts(oldIng)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error getting hosts from old ingress: %w", err)
 	}
 	newHosts, err := getIngressHosts(newIng)
+	if err != nil {
+		return nil, fmt.Errorf("error getting hosts from new ingress: %w", err)
+	}
+
+	newHostsMap := make(map[string]struct{}, len(newHosts))
+	for _, h := range newHosts {
+		newHostsMap[h] = struct{}{}
+	}
+
 	for _, oldHost := range oldHosts {
-		if !slices.Contains(newHosts, oldHost) {
+		if _, exists := newHostsMap[oldHost]; !exists {
 			removed = append(removed, oldHost)
 		}
 	}
-	return removed, err
+	return removed, nil
 }
 
+// alisesAreEqual compares two slices of aliases, ignoring order.
 func alisesAreEqual(existingAliases, serverAliases []string) bool {
 	if len(existingAliases) != len(serverAliases) {
 		return false
+	}
+	if len(existingAliases) == 0 {
+		return true
 	}
 
 	ea := append([]string(nil), existingAliases...)
@@ -412,13 +532,7 @@ func alisesAreEqual(existingAliases, serverAliases []string) bool {
 	sort.Strings(ea)
 	sort.Strings(sa)
 
-	for i := range ea {
-		if ea[i] != sa[i] {
-			return false
-		}
-	}
-
-	return true
+	return slices.Equal(ea, sa)
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -430,54 +544,87 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 		For(&netv1.Ingress{}).
 		Watches(
 			&netv1.Ingress{},
-			&handler.Funcs{CreateFunc: func(ctx context.Context, e event.CreateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-				q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
-			}, UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-				q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.ObjectNew)})
-				l := log.FromContext(ctx)
+			&handler.Funcs{
+				CreateFunc: func(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+				},
+				UpdateFunc: func(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+					l := log.FromContext(ctx).WithValues("ingress", client.ObjectKeyFromObject(e.ObjectNew))
 
-				oldIng, err := handleObject(e.ObjectOld)
-				if err != nil {
-					l.Error(err, "couldn't handle ObjectOld as Ingress")
-					return
-				}
-
-				newIng, err := handleObject(e.ObjectNew)
-				if err != nil {
-					l.Error(err, "couldn't handle ObjectNew as Ingress")
-					return
-				}
-
-				ip, err := mustHaveIPAddress(oldIng)
-				if err != nil {
-					l.Error(err, "couldn't get IP address from Ingress")
-					return
-				}
-
-				removed, err := hostsToRemove(oldIng, newIng)
-				if err != nil {
-					l.Error(err, "couldn't determin hosts to remove")
-					return
-				}
-
-				objMgr := ibclient.NewObjectManager(r.conn, "", "")
-
-				for _, remove := range removed {
-					rec, err := getHostRecord(objMgr, r.cfg, remove, oldIng.Name)
-					if err != nil {
-						l.Error(err, "couldn't get host record")
+					oldIng, okOld := e.ObjectOld.(*netv1.Ingress)
+					newIng, okNew := e.ObjectNew.(*netv1.Ingress)
+					if !okOld || !okNew {
+						l.Error(fmt.Errorf("update event received non-Ingress objects: Old=%T, New=%T", e.ObjectOld, e.ObjectNew), "Update handler received unexpected type")
 						return
 					}
 
-					err = deleteHostRecord(r.conn, rec, cfg, remove, ip, oldIng.Name)
-					if err != nil {
-						l.Error(err, "couldn't delete host record")
+					shouldManageNew := isManagedByController(newIng)
+					wasManagedOld := isManagedByController(oldIng)
+
+					if !shouldManageNew {
+						if wasManagedOld {
+							l.Info("Ingress annotation removed or changed to false, queueing for potential cleanup")
+							q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(newIng)})
+						} else {
+							l.V(1).Info("Ingress update skipped, not managed by controller")
+						}
 						return
 					}
-				}
-			}, DeleteFunc: func(ctx context.Context, e event.DeleteEvent, q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-				q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
-			}},
+
+					l.V(1).Info("Processing update for managed ingress")
+
+					var ipForDeletionLogging string
+					if len(oldIng.Status.LoadBalancer.Ingress) > 0 {
+						ipForDeletionLogging = oldIng.Status.LoadBalancer.Ingress[0].IP
+					}
+
+					removed, err := hostsToRemove(oldIng, newIng)
+					if err != nil {
+						l.Error(err, "Could not determine hosts to remove during update")
+						q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(newIng)})
+						return
+					}
+
+					if len(removed) > 0 {
+						l.Info("Detected removed hosts, attempting deletion", "removedHosts", removed)
+						objMgr := ibclient.NewObjectManager(r.conn, "", "")
+
+						for _, hostToRemove := range removed {
+							l := l.WithValues("host", hostToRemove)
+							rec, err := getHostRecord(objMgr, r.cfg, hostToRemove, oldIng.Name)
+							if err != nil {
+								var notfound *ibclient.NotFoundError
+								if errors.As(err, &notfound) {
+									l.Info("Host record not found for deletion during update, skipping", "host", hostToRemove)
+									continue
+								}
+								l.Error(err, "Could not get host record for deletion during update", "host", hostToRemove)
+								continue
+							}
+
+							l.Info("Attempting to delete host record for removed host")
+							err = deleteHostRecord(r.conn, rec, r.cfg, hostToRemove, ipForDeletionLogging, oldIng.Name)
+							if err != nil {
+								l.Error(err, "Could not delete host record for removed host")
+							} else {
+								l.Info("Successfully deleted host record for removed host")
+							}
+						}
+					}
+
+					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(newIng)})
+				},
+				DeleteFunc: func(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+					l := log.FromContext(ctx)
+					l.V(1).Info("Delete event received, queueing for finalizer check", "ingress", client.ObjectKeyFromObject(e.Object))
+					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+				},
+				GenericFunc: func(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+					l := log.FromContext(ctx)
+					l.V(1).Info("Generic event received, queueing", "ingress", client.ObjectKeyFromObject(e.Object))
+					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
+				},
+			},
 		).
 		Complete(r)
 }
