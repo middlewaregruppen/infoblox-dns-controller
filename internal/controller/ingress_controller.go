@@ -114,39 +114,45 @@ func init() {
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	l := log.FromContext(ctx).WithValues("ingress", req.NamespacedName)
+	l := log.FromContext(ctx) // Base logger
 
 	ingress := &netv1.Ingress{}
 	if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// Add ingress context for subsequent logs
+	ingressKey := req.NamespacedName.String()
+
 	if !isManagedByController(ingress) {
-		l.V(1).Info("Ingress is not managed by this controller, skipping")
+		l.V(1).Info("Ingress is not managed by this controller, skipping", "ingress", ingressKey)
 		if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
-			l.Info("Removing finalizer from unmanaged ingress")
+			l.Info("Removing finalizer from unmanaged ingress", "ingress", ingressKey)
 			if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
+				if client.IgnoreNotFound(err) != nil {
+					l.Error(err, "Failed to re-fetch ingress before removing finalizer from unmanaged object", "ingress", ingressKey)
+				}
 				return ctrl.Result{}, client.IgnoreNotFound(err)
 			}
 			if ok := controllerutil.RemoveFinalizer(ingress, ingressFinalizers); !ok {
-				l.Info("Finalizer already removed or conflict during removal, retrying")
+				l.Info("Finalizer already removed or conflict during removal, retrying", "ingress", ingressKey)
 				return ctrl.Result{Requeue: true}, nil
 			}
 			if err := r.Update(ctx, ingress); err != nil {
-				l.Error(err, "Failed to remove finalizer from unmanaged ingress")
+				l.Error(err, "Failed to remove finalizer from unmanaged ingress", "ingress", ingressKey)
 				return ctrl.Result{}, err
 			}
 		}
 		return ctrl.Result{}, nil
 	}
 
-	l.V(1).Info("Reconciling managed ingress")
+	l.V(1).Info("Reconciling managed ingress", "ingress", ingressKey)
 
 	objMgr := ibclient.NewObjectManager(r.conn, "", "")
 
 	if ingress.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
-			l.Info("Handling deletion for ingress")
+			l.Info("Handling deletion for ingress", "ingress", ingressKey)
 
 			var lastKnownHosts []string
 			var ipAddressForDeletion string
@@ -157,7 +163,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 			currentHosts, err := getIngressHosts(ingress)
 			if err != nil {
-				l.Error(err, "Could not get hosts from ingress spec during deletion, proceeding without host list")
+				l.Error(err, "Could not get hosts from ingress spec during deletion, proceeding without host list", "ingress", ingressKey)
 			} else {
 				lastKnownHosts = currentHosts
 			}
@@ -168,45 +174,45 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				if err != nil {
 					var notfound *ibclient.NotFoundError
 					if errors.As(err, &notfound) {
-						l.Info("Host record not found during deletion, skipping", "host", host)
+						l.Info("Host record not found during deletion, skipping", "ingress", ingressKey, "host", host)
 						continue
 					}
-					l.Error(err, "Failed to get host record for deletion", "host", host)
+					l.Error(err, "Failed to get host record for deletion", "ingress", ingressKey, "host", host)
 					deletionErrors = true
 					continue
 				}
 
-				l.Info("Attempting to delete host record", "host", host)
+				l.Info("Attempting to delete host record", "ingress", ingressKey, "host", host)
 				err = deleteHostRecord(r.conn, rec, r.cfg, host, ipAddressForDeletion, ingress.Name)
 				if err != nil {
-					l.Error(err, "Failed to delete host record", "host", host)
+					l.Error(err, "Failed to delete host record", "ingress", ingressKey, "host", host)
 					deletionErrors = true
 				} else {
-					l.Info("Successfully deleted host record", "host", host)
+					l.Info("Successfully deleted host record", "ingress", ingressKey, "host", host)
 				}
 			}
 
 			if !deletionErrors {
-				l.Info("All known host records handled for deletion, removing finalizer")
+				l.Info("All known host records handled for deletion, removing finalizer", "ingress", ingressKey)
 				if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
 					if client.IgnoreNotFound(err) == nil {
-						l.Info("Ingress already deleted, finalizer removal likely succeeded or is irrelevant")
+						l.Info("Ingress already deleted, finalizer removal likely succeeded or is irrelevant", "ingress", ingressKey)
 						return ctrl.Result{}, nil
 					}
-					l.Error(err, "Failed to re-fetch ingress before removing finalizer")
+					l.Error(err, "Failed to re-fetch ingress before removing finalizer", "ingress", ingressKey)
 					return ctrl.Result{}, err
 				}
 				if controllerutil.RemoveFinalizer(ingress, ingressFinalizers) {
 					if err := r.Update(ctx, ingress); err != nil {
-						l.Error(err, "Failed to remove finalizer")
+						l.Error(err, "Failed to update ingress after removing finalizer", "ingress", ingressKey)
 						return ctrl.Result{}, err
 					}
-					l.Info("Finalizer removed")
+					l.Info("Finalizer removed successfully", "ingress", ingressKey)
 				} else {
-					l.Info("Finalizer already removed or conflict, reconciliation likely complete")
+					l.Info("Finalizer already removed or conflict, reconciliation likely complete", "ingress", ingressKey)
 				}
 			} else {
-				l.Error(nil, "Errors occurred during host record deletion, finalizer not removed, requeuing")
+				l.Error(nil, "Errors occurred during host record deletion, finalizer not removed, requeuing", "ingress", ingressKey)
 				return ctrl.Result{Requeue: true}, nil
 			}
 		}
@@ -214,62 +220,64 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if !controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
-		l.Info("Adding finalizer")
+		l.Info("Adding finalizer", "ingress", ingressKey)
 		if err := r.Get(ctx, req.NamespacedName, ingress); err != nil {
-			l.Error(err, "Failed to re-fetch ingress before adding finalizer")
+			l.Error(err, "Failed to re-fetch ingress before adding finalizer", "ingress", ingressKey)
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
 		if ok := controllerutil.AddFinalizer(ingress, ingressFinalizers); !ok {
-			l.Info("Finalizer already present or conflict during add, retrying")
+			l.Info("Finalizer already present or conflict during add, retrying", "ingress", ingressKey)
 			return ctrl.Result{Requeue: true}, nil
 		}
 		if err := r.Update(ctx, ingress); err != nil {
-			l.Error(err, "Failed to add finalizer")
+			l.Error(err, "Failed to update ingress after adding finalizer", "ingress", ingressKey)
 			return ctrl.Result{}, err
 		}
+		l.Info("Finalizer added, requeueing for main reconcile", "ingress", ingressKey)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
 	if len(ingress.Status.LoadBalancer.Ingress) == 0 || ingress.Status.LoadBalancer.Ingress[0].IP == "" {
-		l.Info("Ingress does not have an IP address yet. Retrying in 30s")
+		l.Info("Ingress does not have an IP address yet. Retrying in 30s", "ingress", ingressKey)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	ipaddress := ingress.Status.LoadBalancer.Ingress[0].IP
+	l.V(1).Info("Using IP address for DNS records", "ingress", ingressKey, "ipaddress", ipaddress)
 
 	desiredHosts, err := getIngressHosts(ingress)
 	if err != nil {
-		l.Error(err, "Failed to get hosts from ingress spec")
+		l.Error(err, "Failed to get hosts from ingress spec", "ingress", ingressKey)
 		return ctrl.Result{}, err
 	}
+	l.V(1).Info("Desired hosts from spec", "ingress", ingressKey, "hosts", desiredHosts)
 
 	serverAliases := getIngressAliases(ingress)
+	l.V(1).Info("Desired aliases from annotations", "ingress", ingressKey, "aliases", serverAliases)
 
 	var encounteredError error
 	requeueNeeded := false
 
 	for _, host := range desiredHosts {
-		l := l.WithValues("host", host)
-
 		rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
 		if err != nil {
 			var notfound *ibclient.NotFoundError
 			if errors.As(err, &notfound) {
-				l.Info("Creating host record", "ip", ipaddress, "aliases", serverAliases)
+				l.Info("Host record not found, creating", "ingress", ingressKey, "host", host, "ip", ipaddress, "aliases", serverAliases)
 				err = createHostRecord(objMgr, r.cfg, host, ipaddress, ingress.Name, serverAliases)
 				if err != nil {
-					l.Error(err, "Failed to create host record")
+					l.Error(err, "Failed to create host record", "ingress", ingressKey, "host", host)
 					if encounteredError == nil {
-						encounteredError = fmt.Errorf("failed to create host record %s: %w", host, err)
+						encounteredError = fmt.Errorf("failed to create host record %s for ingress %s: %w", host, req.NamespacedName, err)
 					}
 				} else {
-					l.Info("Successfully created host record")
+					l.Info("Successfully created host record", "ingress", ingressKey, "host", host)
 					requeueNeeded = true
 				}
 				continue
 			} else {
-				l.Error(err, "Failed to get host record from Infoblox")
+				l.Error(err, "Failed to get host record from Infoblox", "ingress", ingressKey, "host", host)
 				if encounteredError == nil {
-					encounteredError = fmt.Errorf("failed to get host record %s: %w", host, err)
+					encounteredError = fmt.Errorf("failed to get host record %s for ingress %s: %w", host, req.NamespacedName, err)
 				}
 				continue
 			}
@@ -277,40 +285,40 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 		hostRecordIp, err := objMgr.GetIpAddressFromHostRecord(*rec)
 		if err != nil {
-			l.Error(err, "Failed to get IP address from existing host record", "recordRef", rec.Ref)
+			l.Error(err, "Failed to get IP address from existing host record", "ingress", ingressKey, "host", host, "recordRef", rec.Ref)
 			if encounteredError == nil {
-				encounteredError = fmt.Errorf("failed to get IP from host record %s: %w", host, err)
+				encounteredError = fmt.Errorf("failed to get IP from host record %s (%s) for ingress %s: %w", host, rec.Ref, req.NamespacedName, err)
 			}
 			continue
 		}
 
 		if !alisesAreEqual(rec.Aliases, serverAliases) || hostRecordIp != ipaddress {
-			l.Info("Updating host record", "oldIp", hostRecordIp, "newIp", ipaddress, "oldAliases", rec.Aliases, "newAliases", serverAliases)
+			l.Info("Updating host record", "ingress", ingressKey, "host", host, "oldIp", hostRecordIp, "newIp", ipaddress, "oldAliases", rec.Aliases, "newAliases", serverAliases, "recordRef", rec.Ref)
 			err = updateHostRecord(objMgr, r.cfg, rec.Ref, host, ipaddress, ingress.Name, serverAliases)
 			if err != nil {
-				l.Error(err, "Failed to update host record")
+				l.Error(err, "Failed to update host record", "ingress", ingressKey, "host", host, "recordRef", rec.Ref)
 				if encounteredError == nil {
-					encounteredError = fmt.Errorf("failed to update host record %s: %w", host, err)
+					encounteredError = fmt.Errorf("failed to update host record %s (%s) for ingress %s: %w", host, rec.Ref, req.NamespacedName, err)
 				}
 			} else {
-				l.Info("Successfully updated host record")
+				l.Info("Successfully updated host record", "ingress", ingressKey, "host", host, "recordRef", rec.Ref)
 				requeueNeeded = true
 			}
 		} else {
-			l.V(1).Info("Host record is up-to-date")
+			l.V(1).Info("Host record is up-to-date", "ingress", ingressKey, "host", host)
 		}
 	}
 
 	if encounteredError != nil {
-		l.Error(encounteredError, "Errors occurred during reconciliation, requeuing")
+		l.Error(encounteredError, "Errors occurred during reconciliation, requeuing", "ingress", ingressKey)
 		return ctrl.Result{Requeue: true}, nil
 	}
 	if requeueNeeded {
-		l.Info("Requeueing shortly to verify changes")
+		l.Info("Requeueing shortly to verify changes", "ingress", ingressKey)
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
-	l.V(1).Info("Reconciliation complete")
+	l.V(1).Info("Reconciliation complete for ingress", "ingress", ingressKey)
 	return ctrl.Result{}, nil
 }
 
@@ -339,35 +347,12 @@ func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host
 	ttl := uint32(30)
 
 	_, err := objMgr.CreateHostRecord(
-		true,      // enabledns
-		false,     // enabledhcp
-		fqdn,      // recordName
-		"",        // DNS View (Ensure this matches original intent)
-		cfg.View,  // DNS Zone (Ensure this matches original intent, likely cfg.View or cfg.Zone)
-		"",        // ipv4cidr
-		"",        // ipv6cidr
-		ipaddress, // ipv4Addr
-		"",        // ipv6Addr
-		"",        // macAddr
-		"",        // comment
-		true,      // useTTL
-		ttl,       // ttl
-		"",        // eaSearch
-		nil,       // eas
-		aliases,   // aliases
-		false,     // useForExtData
+		true, false, fqdn, "", cfg.View, "", "", ipaddress, "", "", "", true, ttl, "", nil, aliases, false,
 	)
 
 	if err == nil {
-		// Ensure labels match the parameters used in the call
 		counterRecordsAdded.With(prometheus.Labels{
-			"type":         "HOST",
-			"net_view":     "",       // Reflects "" used for DNS View param
-			"dns_view":     cfg.View, // Reflects cfg.View used for DNS Zone param
-			"host":         fqdn,
-			"ipv4address":  ipaddress,
-			"ipv6address":  "",
-			"ingress_name": ingressName,
+			"type": "HOST", "net_view": "", "dns_view": cfg.View, "host": fqdn, "ipv4address": ipaddress, "ipv6address": "", "ingress_name": ingressName,
 		}).Inc()
 	}
 	return err
@@ -379,36 +364,12 @@ func updateHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host
 	ttl := uint32(30)
 
 	_, err := objMgr.UpdateHostRecord(
-		hostRef,   // ref
-		true,      // enabledns
-		false,     // enabledhcp
-		fqdn,      // recordName
-		"",        // DNS View (Ensure this matches original intent)
-		cfg.View,  // DNS Zone (Ensure this matches original intent, likely cfg.View or cfg.Zone)
-		"",        // ipv4cidr
-		"",        // ipv6cidr
-		ipaddress, // ipv4Addr
-		"",        // ipv6Addr
-		"",        // macAddr
-		"",        // comment
-		true,      // useTTL
-		ttl,       // ttl
-		"",        // eaSearch
-		nil,       // eas
-		aliases,   // aliases
-		false,     // useForExtData
+		hostRef, true, false, fqdn, "", cfg.View, "", "", ipaddress, "", "", "", true, ttl, "", nil, aliases, false,
 	)
 
 	if err == nil {
-		// Ensure labels match the parameters used in the call
 		counterRecordsUpdated.With(prometheus.Labels{
-			"type":         "HOST",
-			"net_view":     "",       // Reflects "" used for DNS View param
-			"dns_view":     cfg.View, // Reflects cfg.View used for DNS Zone param
-			"host":         fqdn,
-			"ipv4address":  ipaddress,
-			"ipv6address":  "",
-			"ingress_name": ingressName,
+			"type": "HOST", "net_view": "", "dns_view": cfg.View, "host": fqdn, "ipv4address": ipaddress, "ipv6address": "", "ingress_name": ingressName,
 		}).Inc()
 	}
 	return err
@@ -420,13 +381,7 @@ func deleteHostRecord(conn *ibclient.Connector, rec *ibclient.HostRecord, cfg *I
 	_, err := conn.DeleteObject(ref)
 	if err == nil {
 		counterRecordsRemoved.With(prometheus.Labels{
-			"type":         "HOST",
-			"net_view":     "",
-			"dns_view":     cfg.View,
-			"host":         host,
-			"ipv4address":  ipaddress,
-			"ipv6address":  "",
-			"ingress_name": ingressName,
+			"type": "HOST", "net_view": "", "dns_view": cfg.View, "host": host, "ipv4address": ipaddress, "ipv6address": "", "ingress_name": ingressName,
 		}).Inc()
 	}
 	return err
@@ -546,15 +501,18 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 			&netv1.Ingress{},
 			&handler.Funcs{
 				CreateFunc: func(ctx context.Context, e event.TypedCreateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+					ingressKey := client.ObjectKeyFromObject(e.Object).String()
+					log.FromContext(ctx).V(1).Info("Create event received, queueing", "ingress", ingressKey)
 					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
 				},
 				UpdateFunc: func(ctx context.Context, e event.TypedUpdateEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-					l := log.FromContext(ctx).WithValues("ingress", client.ObjectKeyFromObject(e.ObjectNew))
+					ingressKey := client.ObjectKeyFromObject(e.ObjectNew).String()
+					l := log.FromContext(ctx) // Base logger
 
 					oldIng, okOld := e.ObjectOld.(*netv1.Ingress)
 					newIng, okNew := e.ObjectNew.(*netv1.Ingress)
 					if !okOld || !okNew {
-						l.Error(fmt.Errorf("update event received non-Ingress objects: Old=%T, New=%T", e.ObjectOld, e.ObjectNew), "Update handler received unexpected type")
+						l.Error(fmt.Errorf("update event received non-Ingress objects: Old=%T, New=%T", e.ObjectOld, e.ObjectNew), "Update handler received unexpected type", "ingress", ingressKey)
 						return
 					}
 
@@ -563,15 +521,15 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 
 					if !shouldManageNew {
 						if wasManagedOld {
-							l.Info("Ingress annotation removed or changed to false, queueing for potential cleanup")
+							l.Info("Ingress annotation removed or changed to false, queueing for potential cleanup", "ingress", ingressKey)
 							q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(newIng)})
 						} else {
-							l.V(1).Info("Ingress update skipped, not managed by controller")
+							l.V(1).Info("Ingress update skipped, not managed by controller", "ingress", ingressKey)
 						}
 						return
 					}
 
-					l.V(1).Info("Processing update for managed ingress")
+					l.V(1).Info("Processing update for managed ingress", "ingress", ingressKey)
 
 					var ipForDeletionLogging string
 					if len(oldIng.Status.LoadBalancer.Ingress) > 0 {
@@ -580,48 +538,49 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 
 					removed, err := hostsToRemove(oldIng, newIng)
 					if err != nil {
-						l.Error(err, "Could not determine hosts to remove during update")
+						l.Error(err, "Could not determine hosts to remove during update", "ingress", ingressKey)
 						q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(newIng)})
 						return
 					}
 
 					if len(removed) > 0 {
-						l.Info("Detected removed hosts, attempting deletion", "removedHosts", removed)
+						l.Info("Detected removed hosts, attempting deletion", "ingress", ingressKey, "removedHosts", removed)
 						objMgr := ibclient.NewObjectManager(r.conn, "", "")
 
 						for _, hostToRemove := range removed {
-							l := l.WithValues("host", hostToRemove)
 							rec, err := getHostRecord(objMgr, r.cfg, hostToRemove, oldIng.Name)
 							if err != nil {
 								var notfound *ibclient.NotFoundError
 								if errors.As(err, &notfound) {
-									l.Info("Host record not found for deletion during update, skipping", "host", hostToRemove)
+									l.Info("Host record not found for deletion during update, skipping", "ingress", ingressKey, "host", hostToRemove)
 									continue
 								}
-								l.Error(err, "Could not get host record for deletion during update", "host", hostToRemove)
+								l.Error(err, "Could not get host record for deletion during update", "ingress", ingressKey, "host", hostToRemove)
 								continue
 							}
 
-							l.Info("Attempting to delete host record for removed host")
+							l.Info("Attempting to delete host record for removed host", "ingress", ingressKey, "host", hostToRemove)
 							err = deleteHostRecord(r.conn, rec, r.cfg, hostToRemove, ipForDeletionLogging, oldIng.Name)
 							if err != nil {
-								l.Error(err, "Could not delete host record for removed host")
+								l.Error(err, "Could not delete host record for removed host", "ingress", ingressKey, "host", hostToRemove)
 							} else {
-								l.Info("Successfully deleted host record for removed host")
+								l.Info("Successfully deleted host record for removed host", "ingress", ingressKey, "host", hostToRemove)
 							}
 						}
 					}
-
+					l.V(1).Info("Update event processed, queueing for reconcile", "ingress", ingressKey)
 					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(newIng)})
 				},
 				DeleteFunc: func(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+					ingressKey := client.ObjectKeyFromObject(e.Object).String()
 					l := log.FromContext(ctx)
-					l.V(1).Info("Delete event received, queueing for finalizer check", "ingress", client.ObjectKeyFromObject(e.Object))
+					l.V(1).Info("Delete event received, queueing for finalizer check", "ingress", ingressKey)
 					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
 				},
 				GenericFunc: func(ctx context.Context, e event.TypedGenericEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+					ingressKey := client.ObjectKeyFromObject(e.Object).String()
 					l := log.FromContext(ctx)
-					l.V(1).Info("Generic event received, queueing", "ingress", client.ObjectKeyFromObject(e.Object))
+					l.V(1).Info("Generic event received, queueing", "ingress", ingressKey)
 					q.Add(reconcile.Request{NamespacedName: client.ObjectKeyFromObject(e.Object)})
 				},
 			},
