@@ -148,28 +148,35 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	l.V(1).Info("Reconciling managed ingress", "ingress", ingressKey)
 
+	ingressHosts, err := getIngressHosts(ingress)
+	if err != nil {
+		l.Error(err, "Could not get hosts from ingress", "ingress", ingressKey)
+		return ctrl.Result{}, err
+	}
+
+	for _, h := range ingressHosts {
+		hasSuffix := strings.HasSuffix(h, ".k8s.vgregion.se")
+
+		if !hasSuffix {
+			l.Error(nil, "Host does not end with \".k8s.vgregion.se\". Please use server-alias to provision hosts outside of the .k8s subdomain. Check user-docs for more information", "ingress", ingressKey, "host", h)
+			return ctrl.Result{}, nil
+		}
+	}
+
 	objMgr := ibclient.NewObjectManager(r.conn, "", "")
 
 	if ingress.GetDeletionTimestamp() != nil {
 		if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
 			l.Info("Handling deletion for ingress", "ingress", ingressKey)
 
-			var lastKnownHosts []string
 			var ipAddressForDeletion string
 
 			if len(ingress.Status.LoadBalancer.Ingress) > 0 {
 				ipAddressForDeletion = ingress.Status.LoadBalancer.Ingress[0].IP
 			}
 
-			currentHosts, err := getIngressHosts(ingress)
-			if err != nil {
-				l.Error(err, "Could not get hosts from ingress spec during deletion, proceeding without host list", "ingress", ingressKey)
-			} else {
-				lastKnownHosts = currentHosts
-			}
-
 			deletionErrors := false
-			for _, host := range lastKnownHosts {
+			for _, host := range ingressHosts {
 				rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
 				if err != nil {
 					var notfound *ibclient.NotFoundError
@@ -244,12 +251,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	ipaddress := ingress.Status.LoadBalancer.Ingress[0].IP
 	l.V(1).Info("Using IP address for DNS records", "ingress", ingressKey, "ipaddress", ipaddress)
 
-	desiredHosts, err := getIngressHosts(ingress)
-	if err != nil {
-		l.Error(err, "Failed to get hosts from ingress spec", "ingress", ingressKey)
-		return ctrl.Result{}, err
-	}
-	l.V(1).Info("Desired hosts from spec", "ingress", ingressKey, "hosts", desiredHosts)
+	l.V(1).Info("Desired hosts from spec", "ingress", ingressKey, "hosts", ingressHosts)
 
 	serverAliases := getIngressAliases(ingress)
 	l.V(1).Info("Desired aliases from annotations", "ingress", ingressKey, "aliases", serverAliases)
@@ -257,7 +259,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	var encounteredError error
 	requeueNeeded := false
 
-	for _, host := range desiredHosts {
+	for _, host := range ingressHosts {
 		rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
 		if err != nil {
 			var notfound *ibclient.NotFoundError
@@ -324,16 +326,16 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 // getHostRecord finds and returns a host record by name.
 func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, ingressName string) (*ibclient.HostRecord, error) {
-	fqdn := name
-	rec, err := objMgr.GetHostRecord(fqdn, cfg.View, "", "", "")
+	rec, err := objMgr.GetHostRecord("", cfg.View, name, "", "")
 	if err != nil {
 		return nil, err
 	}
+
 	counterRecordsRetrieved.With(prometheus.Labels{
 		"type":         "HOST",
 		"net_view":     "",
 		"dns_view":     cfg.View,
-		"host":         fqdn,
+		"host":         name,
 		"ipv4address":  "",
 		"ipv6address":  "",
 		"ingress_name": ingressName,
