@@ -96,6 +96,7 @@ type InfobloxConfig struct {
 	Zone        string
 	Version     string
 	AliasSuffix string
+	Cluster     string
 }
 
 func init() {
@@ -124,7 +125,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Add ingress context for subsequent logs
 	ingressKey := req.NamespacedName.String()
 
-	if !isManagedByController(ingress) {
+	if !isIngressManaged(ingress) {
 		l.V(1).Info("Ingress is not managed by this controller, skipping", "ingress", ingressKey)
 		if controllerutil.ContainsFinalizer(ingress, ingressFinalizers) {
 			l.Info("Removing finalizer from unmanaged ingress", "ingress", ingressKey)
@@ -170,7 +171,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			l.Info("Handling deletion for ingress", "ingress", ingressKey)
 
 			var ipAddressForDeletion string
-
 			if len(ingress.Status.LoadBalancer.Ingress) > 0 {
 				ipAddressForDeletion = ingress.Status.LoadBalancer.Ingress[0].IP
 			}
@@ -186,6 +186,11 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					}
 					l.Error(err, "Failed to get host record for deletion", "ingress", ingressKey, "host", host)
 					deletionErrors = true
+					continue
+				}
+
+				if !hasRecordOwnership(*rec.Comment, r.cfg.Cluster) {
+					l.Info("This host record is managed by another cluster, skipping deletion", "ingress", ingressKey, "host", host, "comment", rec.Comment)
 					continue
 				}
 
@@ -285,6 +290,14 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			}
 		}
 
+		if !hasRecordOwnership(*rec.Comment, r.cfg.Cluster) {
+			l.Error(nil, "Host record is managed by another cluster, cannot update.", "ingress", ingressKey, "host", host, "comment", rec.Comment)
+			if encounteredError == nil {
+				encounteredError = fmt.Errorf("host record %s is managed by another cluster (%s)", host, rec.Comment)
+			}
+			continue
+		}
+
 		hostRecordIp, err := objMgr.GetIpAddressFromHostRecord(*rec)
 		if err != nil {
 			l.Error(err, "Failed to get IP address from existing host record", "ingress", ingressKey, "host", host, "recordRef", rec.Ref)
@@ -294,8 +307,10 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			continue
 		}
 
-		if !alisesAreEqual(rec.Aliases, serverAliases) || hostRecordIp != ipaddress {
-			l.Info("Updating host record", "ingress", ingressKey, "host", host, "oldIp", hostRecordIp, "newIp", ipaddress, "oldAliases", rec.Aliases, "newAliases", serverAliases, "recordRef", rec.Ref)
+		desiredComment := fmt.Sprintf("managedByCluster=%s", r.cfg.Cluster)
+
+		if !alisesAreEqual(rec.Aliases, serverAliases) || hostRecordIp != ipaddress || *rec.Comment != desiredComment {
+			l.Info("Updating host record", "ingress", ingressKey, "host", host, "oldIp", hostRecordIp, "newIp", ipaddress, "oldAliases", rec.Aliases, "newAliases", serverAliases, "oldComment", rec.Comment, "newComment", desiredComment, "recordRef", rec.Ref)
 			err = updateHostRecord(objMgr, r.cfg, rec.Ref, host, ipaddress, ingress.Name, serverAliases)
 			if err != nil {
 				l.Error(err, "Failed to update host record", "ingress", ingressKey, "host", host, "recordRef", rec.Ref)
@@ -343,35 +358,35 @@ func getHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, name, i
 	return rec, nil
 }
 
-// createHostRecord creates a new host record using the original signature.
+// createHostRecord creates a new host record
 func createHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, host, ipaddress, ingressName string, aliases []string) error {
-	fqdn := host
 	ttl := uint32(30)
+	managedByString := fmt.Sprintf("managedByCluster=%s", cfg.Cluster)
 
 	_, err := objMgr.CreateHostRecord(
-		true, false, fqdn, "", cfg.View, "", "", ipaddress, "", "", "", true, ttl, "", nil, aliases, false,
+		true, false, host, "", cfg.View, "", "", ipaddress, "", "", "", true, ttl, managedByString, nil, aliases, false,
 	)
 
 	if err == nil {
 		counterRecordsAdded.With(prometheus.Labels{
-			"type": "HOST", "net_view": "", "dns_view": cfg.View, "host": fqdn, "ipv4address": ipaddress, "ipv6address": "", "ingress_name": ingressName,
+			"type": "HOST", "net_view": "", "dns_view": cfg.View, "host": host, "ipv4address": ipaddress, "ipv6address": "", "ingress_name": ingressName,
 		}).Inc()
 	}
 	return err
 }
 
-// updateHostRecord updates an existing host record using the original signature pattern.
+// updateHostRecord updates an existing host record
 func updateHostRecord(objMgr ibclient.IBObjectManager, cfg *InfobloxConfig, hostRef string, host, ipaddress, ingressName string, aliases []string) error {
-	fqdn := host
 	ttl := uint32(30)
+	managedByString := fmt.Sprintf("managedByCluster=%s", cfg.Cluster)
 
 	_, err := objMgr.UpdateHostRecord(
-		hostRef, true, false, fqdn, "", cfg.View, "", "", ipaddress, "", "", "", true, ttl, "", nil, aliases, false,
+		hostRef, true, false, host, "", cfg.View, "", "", ipaddress, "", "", "", true, ttl, managedByString, nil, aliases, false,
 	)
 
 	if err == nil {
 		counterRecordsUpdated.With(prometheus.Labels{
-			"type": "HOST", "net_view": "", "dns_view": cfg.View, "host": fqdn, "ipv4address": ipaddress, "ipv6address": "", "ingress_name": ingressName,
+			"type": "HOST", "net_view": "", "dns_view": cfg.View, "host": host, "ipv4address": ipaddress, "ipv6address": "", "ingress_name": ingressName,
 		}).Inc()
 	}
 	return err
@@ -389,8 +404,8 @@ func deleteHostRecord(conn *ibclient.Connector, rec *ibclient.HostRecord, cfg *I
 	return err
 }
 
-// isManagedByController checks for the presence of specific annotations.
-func isManagedByController(ing *netv1.Ingress) bool {
+// isIngressManaged checks the Ingress annotations to determine if it should be reconciled by the controller.
+func isIngressManaged(ing *netv1.Ingress) bool {
 	annotations := ing.GetAnnotations()
 	if annotations == nil {
 		return false
@@ -492,6 +507,16 @@ func alisesAreEqual(existingAliases, serverAliases []string) bool {
 	return slices.Equal(ea, sa)
 }
 
+// hasRecordOwnership checks an Infoblox records comment to determine if this controller instance owns it
+func hasRecordOwnership(comment, currentClusterName string) bool {
+	if strings.HasPrefix(comment, "managedByCluster=") {
+		expectedComment := fmt.Sprintf("managedByCluster=%s", currentClusterName)
+		return comment == expectedComment
+	}
+
+	return true
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Connector, cfg *InfobloxConfig) error {
 	r.conn = conn
@@ -518,8 +543,8 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 						return
 					}
 
-					shouldManageNew := isManagedByController(newIng)
-					wasManagedOld := isManagedByController(oldIng)
+					shouldManageNew := isIngressManaged(newIng)
+					wasManagedOld := isIngressManaged(oldIng)
 
 					if !shouldManageNew {
 						if wasManagedOld {
@@ -558,6 +583,11 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 									continue
 								}
 								l.Error(err, "Could not get host record for deletion during update", "ingress", ingressKey, "host", hostToRemove)
+								continue
+							}
+
+							if !hasRecordOwnership(*rec.Comment, r.cfg.Cluster) {
+								l.Info("This host record is managed by another cluster, skipping deletion", "ingress", ingressKey, "host", hostToRemove, "comment", rec.Comment)
 								continue
 							}
 
