@@ -257,7 +257,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	l.V(1).Info("Desired aliases from annotations", "ingress", ingressKey, "aliases", serverAliases)
 
 	var encounteredError error
-	requeueNeeded := false
 
 	for _, host := range ingressHosts {
 		rec, err := getHostRecord(objMgr, r.cfg, host, ingress.Name)
@@ -273,7 +272,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 					}
 				} else {
 					l.Info("Successfully created host record", "ingress", ingressKey, "host", host)
-					requeueNeeded = true
 				}
 				continue
 			} else {
@@ -304,7 +302,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				}
 			} else {
 				l.Info("Successfully updated host record", "ingress", ingressKey, "host", host, "recordRef", rec.Ref)
-				requeueNeeded = true
 			}
 		} else {
 			l.V(1).Info("Host record is up-to-date", "ingress", ingressKey, "host", host)
@@ -314,10 +311,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if encounteredError != nil {
 		l.Error(encounteredError, "Errors occurred during reconciliation, requeuing", "ingress", ingressKey)
 		return ctrl.Result{Requeue: true}, nil
-	}
-	if requeueNeeded {
-		l.Info("Requeueing shortly to verify changes", "ingress", ingressKey)
-		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
 
 	l.V(1).Info("Reconciliation complete for ingress", "ingress", ingressKey)
@@ -520,6 +513,37 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager, conn *ibclient.Co
 
 					shouldManageNew := isManagedByController(newIng)
 					wasManagedOld := isManagedByController(oldIng)
+
+					oldIP := ""
+					if len(oldIng.Status.LoadBalancer.Ingress) > 0 {
+						oldIP = oldIng.Status.LoadBalancer.Ingress[0].IP
+					}
+					newIP := ""
+					if len(newIng.Status.LoadBalancer.Ingress) > 0 {
+						newIP = newIng.Status.LoadBalancer.Ingress[0].IP
+					}
+
+					annotationsChanged := false
+					aliasKeys := []string{
+						"nginx.ingress.kubernetes.io/server-alias",
+						"haproxy-ingress.github.io/server-alias",
+						"infoblox-dns-controller/aliases",
+					}
+					for _, key := range aliasKeys {
+						if oldIng.Annotations[key] != newIng.Annotations[key] {
+							annotationsChanged = true
+							break
+						}
+					}
+
+					if oldIng.Generation == newIng.Generation &&
+						oldIP == newIP &&
+						!annotationsChanged &&
+						wasManagedOld == shouldManageNew &&
+						newIng.GetDeletionTimestamp() == nil {
+						l.V(1).Info("Skipping reconcile for update with no DNS-relevant changes", "ingress", ingressKey)
+						return
+					}
 
 					if !shouldManageNew {
 						if wasManagedOld {
